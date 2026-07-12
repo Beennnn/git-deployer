@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck run.sh
+        run: shellcheck -s bash git-deployer/root/run.sh || true
+      - name: yamllint (config/build/repository)
+        run: |
+          pip install yamllint
+          yamllint -d '{extends: relaxed, rules: {line-length: disable}}' \
+            git-deployer/config.yaml git-deployer/build.yaml repository.yaml
+      - name: hadolint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: git-deployer/Dockerfile
+          failure-threshold: error
