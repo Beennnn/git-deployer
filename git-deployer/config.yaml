@@ -1,0 +1,43 @@
+name: Git Deployer (git → HA)
+version: "0.1.0-alpha.1"
+slug: git-deployer
+description: >-
+  Applique une branche git sur /config — le pendant « déploie » de git-exporter.
+  Garde anti-écrasement, backup, check_config + rollback, reload ciblé.
+url: https://github.com/Beennnn/git-deployer
+stage: experimental
+arch:
+  - aarch64
+  - amd64
+startup: manual
+boot: manual
+init: false
+hassio_api: true
+hassio_role: manager
+homeassistant_api: true
+map:
+  - config:rw
+options:
+  repository:
+    url: ""
+    username: ""
+    password: ""
+    branch: main
+  deploy:
+    subdir: config
+    dry_run: false
+    allow_partial: false
+    backup_before: true
+    interval: 0
+schema:
+  repository:
+    url: match(https://.*)
+    username: str
+    password: password
+    branch: str
+  deploy:
+    subdir: str
+    dry_run: bool
+    allow_partial: bool
+    backup_before: bool
+    interval: int
