@@ -9,7 +9,7 @@ stage: experimental
 arch:
   - aarch64
   - amd64
-startup: manual
+startup: once
 boot: manual
 init: false
 hassio_api: true
