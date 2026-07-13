@@ -91,6 +91,22 @@ its own loop.
 3. First start clones and stops — inspect, then merge a small test PR and start
    again to see the incremental, validated deploy.
 
+
+## Instant install (pre-built images)
+
+By default HA **builds the image locally** on install (1–3 min). To offer a
+**1-click instant install**, images are published to GHCR by
+`.github/workflows/build.yml` on each release. To switch this add-on to pull the
+pre-built image instead of building locally, add to `git-deployer/config.yaml`:
+
+```yaml
+image: "ghcr.io/beennnn/git-deployer-{arch}"
+```
+
+…and make the GHCR packages **public** (Settings → Packages). Do this only once
+images for the current version are confirmed published, otherwise installs/updates
+would fail to pull.
+
 ## Status
 
 **Alpha / experimental.** The deploy algorithm (change detection, anti-clobber
