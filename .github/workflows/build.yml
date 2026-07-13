@@ -4,8 +4,9 @@ name: Publish add-on images
 # (ou manuellement). Tant que config.yaml n'a pas de champ `image:`, HA continue de
 # builder en local ; passer en pré-construit = ajouter `image:` (voir README).
 on:
-  release:
-    types: [published]
+  # TODO: réactiver le trigger `release` une fois les args de home-assistant/builder
+  # calés (build échoue actuellement sur /tmp/build_config/config.json). En attendant
+  # l'addon s'installe très bien en build local. Déclenchement manuel uniquement :
   workflow_dispatch:
 
 permissions:
