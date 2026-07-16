@@ -30,6 +30,9 @@ CONFIG_DIR="${CONFIG_DIR:-/config}"
 WORK_DIR="${WORK_DIR:-/data/repo}"
 HA_API="${HA_API:-http://supervisor/core/api}"
 HA_TOKEN="${HA_TOKEN:-${SUPERVISOR_TOKEN:-}}"
+# Entité HA où publier le SHA déployé (lue par git-exporter skip_when_deploy_pending).
+# Doit correspondre à repository.deployed_sha_entity côté exporter (même défaut).
+DEPLOYED_SHA_ENTITY="${DEPLOYED_SHA_ENTITY:-input_text.ha_deployed_sha}"
 
 TMP="/tmp/git-deployer"
 
@@ -53,6 +56,37 @@ notify() { # notify TITLE MESSAGE
 }
 
 fail() { bashio::log.error "$1"; notify "🔴 git-deployer — échec" "$1"; return 1; }
+
+# publish_deployed_sha SHA — publie le SHA avec lequel /config est désormais cohérent
+# dans une entité HA. Lu par git-exporter (skip_when_deploy_pending) pour NE PAS
+# snapshoter un /config d'avant-déploiement → supprime la course exporter/deployer.
+# À appeler à CHAQUE état cohérent (déployé OU déjà à jour), jamais tant qu'un conflit
+# reste non résolu. Best-effort — n'échoue jamais le déploiement. Voir le repo
+# consommateur ha-vallesvilles-family : docs/design/deploy-snapshot-race.md.
+publish_deployed_sha() {
+  if ha POST /services/input_text/set_value \
+       "{\"entity_id\":\"${DEPLOYED_SHA_ENTITY}\",\"value\":\"$1\"}" >/dev/null 2>&1; then
+    bashio::log.info "deployed_sha publié : ${1:0:8}"
+  else
+    bashio::log.warning "deployed_sha non publié (déploiement OK malgré tout)"
+  fi
+}
+
+# write_status RESULT SHA DETAIL — compte-rendu du dernier déploiement, lisible depuis
+# git SANS accès HA : écrit sous <config>/.deploy/last-run.yaml, donc snapshoté par
+# git-exporter au cycle suivant. Jamais redéployé (filtré dans la boucle d'application).
+# Best-effort. RESULT ∈ OK | CONFLICT | ROLLBACK. Voir ha-vallesvilles-family :
+# docs/ops/deploy-status.md.
+write_status() {
+  local dir="${CONFIG_DIR}/.deploy"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  {
+    printf 'timestamp: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%H:%M:%S')"
+    printf 'result: %s\n'    "$1"
+    printf 'sha: %s\n'       "${2:-}"
+    printf 'detail: %s\n'    "${3:-}"
+  } > "$dir/last-run.yaml" 2>/dev/null || true
+}
 
 deploy_once() {
   rm -rf "$TMP"; mkdir -p "$TMP"
@@ -81,6 +115,7 @@ deploy_once() {
   fi
   if [ "$old" = "$new" ]; then
     bashio::log.info "déjà à jour (${new:0:8}) — rien à déployer."
+    publish_deployed_sha "$new"          # /config déjà cohérent avec new
     return 0
   fi
 
@@ -89,6 +124,7 @@ deploy_once() {
   git -C "$WORK_DIR" diff --no-renames --name-status "$old" "$new" -- "${SUBDIR}/" > "$TMP/changes" || { fail "git diff a échoué"; return 1; }
   if [ ! -s "$TMP/changes" ]; then
     bashio::log.info "aucun changement sous ${SUBDIR}/ — rien à déployer."
+    publish_deployed_sha "$new"          # ${SUBDIR}/ inchangé → /config cohérent avec new
     return 0
   fi
   bashio::log.info "changements détectés :"; cat "$TMP/changes"
@@ -98,6 +134,7 @@ deploy_once() {
   while IFS=$'\t' read -r status path; do
     [ -n "$path" ] || continue
     rel="${path#"${SUBDIR}"/}"
+    case "$rel" in .deploy/*) continue ;; esac  # compte-rendu deploy — snapshoté, jamais redéployé
     live="${CONFIG_DIR}/${rel}"
     case "$status" in
       D*)
@@ -127,11 +164,17 @@ deploy_once() {
     bashio::log.warning "CONFLITS (${nb_confl}) — modifiés en live sans passer par git :"; cat "$TMP/conflicts"
     if [ "$ALLOW_PARTIAL" != "true" ]; then
       notify "⚠️ git-deployer suspendu (conflit)" "${nb_confl} fichier(s) modifié(s) en live non sauvegardés. Rien appliqué."
+      write_status CONFLICT "$new" "${nb_confl} fichier(s) modifié(s) en live — rien appliqué"
       return 0
     fi
     bashio::log.warning "allow_partial : on applique les ${nb_apply} sûrs, on ignore les conflits."
   fi
-  if [ "$nb_apply" = 0 ]; then bashio::log.info "rien de sûr à appliquer."; return 0; fi
+  if [ "$nb_apply" = 0 ]; then
+    bashio::log.info "rien de sûr à appliquer."
+    # Sans conflit, tout était déjà appliqué → /config cohérent avec new.
+    if [ "$nb_confl" = 0 ]; then publish_deployed_sha "$new"; fi
+    return 0
+  fi
 
   bashio::log.info "à appliquer (${nb_apply}) :"; sed 's/^/  /' "$TMP/apply"
   if [ "$DRY_RUN" = "true" ]; then bashio::log.info "dry_run — rien écrit."; return 0; fi
@@ -164,6 +207,7 @@ deploy_once() {
       [ -n "$rel" ] || continue; live="${CONFIG_DIR}/${rel}"
       if [ "$st" = "E" ]; then cp "$BK/$rel" "$live"; else rm -f "$live"; fi
     done < "$TMP/applied"
+    write_status ROLLBACK "$new" "config invalide après déploiement — rollback effectué"
     fail "config invalide après déploiement — rollback effectué."
     return 1
   fi
@@ -182,6 +226,9 @@ deploy_once() {
 
   local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reloaded:- (aucun)}."
   bashio::log.info "OK — $msg"
+  # /config cohérent avec new : marqueur (anti-course) + compte-rendu (lisible via git).
+  publish_deployed_sha "$new"
+  write_status OK "$new" "$msg"
   notify "🟢 git-deployer — déployé" "$msg"
   return 0
 }
