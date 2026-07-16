@@ -1,12 +1,16 @@
 name: Publish add-on images
-# Construit les images multi-arch de l'add-on et les pousse sur GHCR, pour une
-# installation INSTANTANÉE (sans build local). Déclenché à chaque release publiée
-# (ou manuellement). Tant que config.yaml n'a pas de champ `image:`, HA continue de
-# builder en local ; passer en pré-construit = ajouter `image:` (voir README).
+# Construit les images mono-arch de l'add-on et les pousse sur GHCR, pour une
+# installation INSTANTANÉE (sans build local). Tant que config.yaml n'a pas de champ
+# `image:`, HA continue de builder en local ; passer en pré-construit = ajouter
+# `image: "ghcr.io/beennnn/git-deployer-{arch}"` + bump version (voir README).
+#
+# Migré 2026-07-16 de l'action `home-assistant/builder` (DÉPRÉCIÉE et non maintenue —
+# elle refusait le `--target` sous-dossier : "No build information / config.json not
+# found") vers `docker/build-push-action` + buildx/QEMU. Le Dockerfile de l'addon
+# (ARG BUILD_FROM) est réutilisé tel quel ; la base HA per-arch fournit bashio + s6.
 on:
-  # TODO: réactiver le trigger `release` une fois les args de home-assistant/builder
-  # calés (build échoue actuellement sur /tmp/build_config/config.json). En attendant
-  # l'addon s'installe très bien en build local. Déclenchement manuel uniquement :
+  # TODO: réactiver le trigger `release` une fois un run vert observé + `image:` posé
+  # dans config.yaml. En attendant l'addon s'installe très bien en build local.
   workflow_dispatch:
 
 permissions:
@@ -17,28 +21,45 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        arch: [aarch64, amd64]
+        include:
+          - arch: aarch64
+            platform: linux/arm64
+            base: ghcr.io/home-assistant/aarch64-base:3.19
+          - arch: amd64
+            platform: linux/amd64
+            base: ghcr.io/home-assistant/amd64-base:3.19
     steps:
       - uses: actions/checkout@v4
+
+      - name: Lire la version de l'addon
+        id: meta
+        # grep+sed plutôt que yq : zéro dépendance, config.yaml a `version: "x.y.z"`.
+        run: |
+          v=$(grep -E '^version:' git-deployer/config.yaml | sed -E 's/.*"(.*)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version addon : $v"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build & push ${{ matrix.arch }}
-        # Pinné (pas @master flottant) — un builder récent parse le YAML en UTF-8,
-        # ce qui corrige le `config.json not found` (l'ancien master échouait sur les
-        # unicode → / « » de name+description lors de la conversion yaml→json).
-        # 2026.03.2 et pas 2026.06.0 : l'image `ghcr.io/home-assistant/amd64-builder`
-        # n'est PAS publiée pour le tag 2026.06.0 (manifest 404) ; 2026.03.2 = dernière
-        # release avec image builder publiée (manifest 200). Revérifier avant de bumper.
-        uses: home-assistant/builder@2026.03.2
+        uses: docker/build-push-action@v6
         with:
-          args: |
-            --${{ matrix.arch }}
-            --target git-deployer
-            --image "git-deployer-{arch}"
-            --docker-hub "ghcr.io/beennnn"
-            --addon
+          context: git-deployer
+          file: git-deployer/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=${{ matrix.base }}
+          push: true
+          tags: |
+            ghcr.io/beennnn/git-deployer-${{ matrix.arch }}:${{ steps.meta.outputs.version }}
+            ghcr.io/beennnn/git-deployer-${{ matrix.arch }}:latest
