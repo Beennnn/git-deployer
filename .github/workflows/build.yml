@@ -28,7 +28,10 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build & push ${{ matrix.arch }}
-        uses: home-assistant/builder@master
+        # Pinné (pas @master flottant) — un builder récent parse le YAML en UTF-8,
+        # ce qui corrige le `config.json not found` (l'ancien master échouait sur les
+        # unicode → / « » de name+description lors de la conversion yaml→json).
+        uses: home-assistant/builder@2026.06.0
         with:
           args: |
             --${{ matrix.arch }}
