@@ -31,7 +31,10 @@ jobs:
         # Pinné (pas @master flottant) — un builder récent parse le YAML en UTF-8,
         # ce qui corrige le `config.json not found` (l'ancien master échouait sur les
         # unicode → / « » de name+description lors de la conversion yaml→json).
-        uses: home-assistant/builder@2026.06.0
+        # 2026.03.2 et pas 2026.06.0 : l'image `ghcr.io/home-assistant/amd64-builder`
+        # n'est PAS publiée pour le tag 2026.06.0 (manifest 404) ; 2026.03.2 = dernière
+        # release avec image builder publiée (manifest 200). Revérifier avant de bumper.
+        uses: home-assistant/builder@2026.03.2
         with:
           args: |
             --${{ matrix.arch }}
