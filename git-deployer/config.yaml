@@ -1,6 +1,7 @@
 name: Git Deployer (git → HA)
-version: "0.1.0-alpha.2"
+version: "0.1.0-alpha.3"
 slug: git-deployer
+image: "ghcr.io/beennnn/git-deployer-{arch}"
 description: >-
   Applique une branche git sur /config — le pendant « déploie » de git-exporter.
   Garde anti-écrasement, backup, check_config + rollback, reload ciblé.
