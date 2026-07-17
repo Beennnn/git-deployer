@@ -1,16 +1,22 @@
 name: Publish add-on images
 # Construit les images mono-arch de l'add-on et les pousse sur GHCR, pour une
-# installation INSTANTANÉE (sans build local). Tant que config.yaml n'a pas de champ
-# `image:`, HA continue de builder en local ; passer en pré-construit = ajouter
-# `image: "ghcr.io/beennnn/git-deployer-{arch}"` + bump version (voir README).
+# installation INSTANTANÉE (sans build local). `config.yaml` a un champ `image:`
+# (`ghcr.io/beennnn/git-deployer-{arch}`) depuis 2026-07-16 → HA TIRE l'image
+# pré-construite au lieu de builder en local. Conséquence : il FAUT une image publiée
+# pour CHAQUE version, sinon un bump casserait l'install (tag inexistant).
 #
 # Migré 2026-07-16 de l'action `home-assistant/builder` (DÉPRÉCIÉE et non maintenue —
 # elle refusait le `--target` sous-dossier : "No build information / config.json not
 # found") vers `docker/build-push-action` + buildx/QEMU. Le Dockerfile de l'addon
 # (ARG BUILD_FROM) est réutilisé tel quel ; la base HA per-arch fournit bashio + s6.
 on:
-  # TODO: réactiver le trigger `release` une fois un run vert observé + `image:` posé
-  # dans config.yaml. En attendant l'addon s'installe très bien en build local.
+  # Auto-build à chaque push des fichiers de l'addon sur main (donc à chaque bump de
+  # version) → l'image du nouveau tag existe AVANT qu'on n'applique la mise à jour côté HA.
+  push:
+    branches: [main]
+    paths:
+      - 'git-deployer/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
