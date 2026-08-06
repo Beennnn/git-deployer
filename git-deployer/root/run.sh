@@ -134,7 +134,13 @@ deploy_once() {
   while IFS=$'\t' read -r status path; do
     [ -n "$path" ] || continue
     rel="${path#"${SUBDIR}"/}"
-    case "$rel" in .deploy/*) continue ;; esac  # compte-rendu deploy — snapshoté, jamais redéployé
+    # .deploy/* = compte-rendu deploy (snapshoté, jamais redéployé). .ha_run.lock +
+    # .HA_VERSION = fichiers runtime écrits par HA (verrou de démarrage pid/start_ts,
+    # version HA) — jamais de la config à déployer, et .ha_run.lock change à CHAQUE
+    # redémarrage. Les sauter évite (a) d'écraser un fichier runtime live et (b) un
+    # CONFLIT « suppression » tout-ou-rien quand ils sont retirés de git (leur version
+    # live diffère toujours de la version git figée → sinon re-blocage du déploiement).
+    case "$rel" in .deploy/*|.ha_run.lock|.HA_VERSION) continue ;; esac
     live="${CONFIG_DIR}/${rel}"
     case "$status" in
       D*)
