@@ -72,19 +72,32 @@ publish_deployed_sha() {
   fi
 }
 
+# yaml_dq VALUE — émet un scalaire YAML DOUBLE-QUOTÉ correctement échappé.
+# Indispensable pour `detail:` : sa valeur contient parfois un « : » littéral
+# (ex. « Rechargé: automation reload_all ») qui, non quoté, est lu comme un mapping
+# imbriqué → YAML invalide (« mapping values are not allowed here ») → yaml.safe_load
+# échoue pour tout consommateur et yamllint casse le CI côté ha-vallesvilles-family.
+# Échappe backslash PUIS guillemet (l'ordre compte). Cf docs/ops/deploy-status.md.
+yaml_dq() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"   # \ -> \\
+  s="${s//\"/\\\"}"   # " -> \"
+  printf '"%s"' "$s"
+}
+
 # write_status RESULT SHA DETAIL — compte-rendu du dernier déploiement, lisible depuis
 # git SANS accès HA : écrit sous <config>/.deploy/last-run.yaml, donc snapshoté par
 # git-exporter au cycle suivant. Jamais redéployé (filtré dans la boucle d'application).
 # Best-effort. RESULT ∈ OK | CONFLICT | ROLLBACK. Voir ha-vallesvilles-family :
-# docs/ops/deploy-status.md.
+# docs/ops/deploy-status.md. Valeurs quotées (yaml_dq) pour garantir un YAML valide.
 write_status() {
   local dir="${CONFIG_DIR}/.deploy"
   mkdir -p "$dir" 2>/dev/null || return 0
   {
     printf 'timestamp: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%H:%M:%S')"
-    printf 'result: %s\n'    "$1"
-    printf 'sha: %s\n'       "${2:-}"
-    printf 'detail: %s\n'    "${3:-}"
+    printf 'result: %s\n'    "$(yaml_dq "$1")"
+    printf 'sha: %s\n'       "$(yaml_dq "${2:-}")"
+    printf 'detail: %s\n'    "$(yaml_dq "${3:-}")"
   } > "$dir/last-run.yaml" 2>/dev/null || true
 }
 
