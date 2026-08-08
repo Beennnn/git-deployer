@@ -57,6 +57,34 @@ notify() { # notify TITLE MESSAGE
 
 fail() { bashio::log.error "$1"; notify "🔴 git-deployer — échec" "$1"; return 1; }
 
+# notify_clear — retire la notif d'échec dès qu'une passe redevient saine. Sans ça,
+# un hoquet réseau transitoire (DNS de la box qui rate ponctuellement la résolution
+# de github.com → « Could not resolve host ») laissait une notif 🔴 collée alors que
+# la passe suivante repassait verte 15 min plus tard : fausse alerte persistante.
+notify_clear() {
+  ha POST /services/persistent_notification/dismiss \
+     '{"notification_id":"git_deployer"}' >/dev/null 2>&1 || true
+}
+
+# git_retry TRIES -- <args git…> — réessaie une commande git transitoirement
+# faillible (réseau/DNS) avant d'abandonner. Cause concrète observée : le plugin DNS
+# du Superviseur n'a pas d'upstream explicite et dépend de la box (192.168.1.1), qui
+# rate parfois la résolution de github.com. Un seul essai suffisait alors à déclencher
+# une notif alarmante, alors que la connectivité revenait aussitôt. Backoff court :
+# 3 tentatives, 10s puis 20s entre les essais.
+git_retry() {
+  local tries="$1"; shift
+  local n=1 delay
+  while true; do
+    if git "$@"; then return 0; fi
+    if [ "$n" -ge "$tries" ]; then return 1; fi
+    delay=$(( n * 10 ))
+    bashio::log.warning "git échec transitoire (tentative ${n}/${tries}) — réessai dans ${delay}s"
+    sleep "$delay"
+    n=$(( n + 1 ))
+  done
+}
+
 # publish_deployed_sha SHA — publie le SHA avec lequel /config est désormais cohérent
 # dans une entité HA. Lu par git-exporter (skip_when_deploy_pending) pour NE PAS
 # snapshoter un /config d'avant-déploiement → supprime la course exporter/deployer.
@@ -111,15 +139,16 @@ deploy_once() {
     bashio::log.info "fetch ${BRANCH}…"
     git -C "$WORK_DIR" remote set-url origin "$auth_url"
     old="$(git -C "$WORK_DIR" rev-parse HEAD)"
-    git -C "$WORK_DIR" fetch --quiet origin "$BRANCH" || { fail "git fetch a échoué"; return 1; }
+    git_retry 3 -C "$WORK_DIR" fetch --quiet origin "$BRANCH" || { fail "git fetch a échoué (3 tentatives — réseau/DNS ?)"; return 1; }
     git -C "$WORK_DIR" reset --hard --quiet "origin/${BRANCH}" || { fail "git reset a échoué"; return 1; }
   else
     bashio::log.info "clone initial…"
-    git clone --quiet --branch "$BRANCH" "$auth_url" "$WORK_DIR" || { fail "git clone a échoué"; return 1; }
+    git_retry 3 clone --quiet --branch "$BRANCH" "$auth_url" "$WORK_DIR" || { fail "git clone a échoué (3 tentatives — réseau/DNS ?)"; return 1; }
     old=""; first_run=1
   fi
   git -C "$WORK_DIR" remote set-url origin "$REPO_URL"   # ne pas laisser le token dans .git/config
   new="$(git -C "$WORK_DIR" rev-parse HEAD)"
+  notify_clear   # connectivité git OK → efface toute notif d'échec d'une passe antérieure
 
   if [ "$first_run" = 1 ]; then
     bashio::log.warning "PREMIER RUN — clone prêt, aucune application (pas de base de comparaison). Les prochains runs seront incrémentaux."
