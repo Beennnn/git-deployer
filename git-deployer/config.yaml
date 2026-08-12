@@ -1,5 +1,5 @@
 name: Git Deployer (git → HA)
-version: "0.1.0-alpha.7"
+version: "0.1.0-alpha.8"
 slug: git-deployer
 image: "ghcr.io/beennnn/git-deployer-{arch}"
 description: >-
@@ -12,7 +12,11 @@ arch:
   - aarch64
   - amd64
 startup: once
-boot: manual
+# boot: auto — l'addon doit se relancer après un reboot HA. En boot:manual il restait éteint
+# (loop de déploiement silencieuse jusqu'au prochain démarrage manuel) → le watchdog criait à
+# juste titre « silencieux » à chaque reboot. NB : pour une install DÉJÀ en place, ce défaut ne
+# suffit pas — il faut aussi basculer « Démarrer au démarrage » côté Superviseur (start_on_boot).
+boot: auto
 init: false
 hassio_api: true
 hassio_role: manager

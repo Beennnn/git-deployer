@@ -33,6 +33,14 @@ HA_TOKEN="${HA_TOKEN:-${SUPERVISOR_TOKEN:-}}"
 # Entité HA où publier le SHA déployé (lue par git-exporter skip_when_deploy_pending).
 # Doit correspondre à repository.deployed_sha_entity côté exporter (même défaut).
 DEPLOYED_SHA_ENTITY="${DEPLOYED_SHA_ENTITY:-input_text.ha_deployed_sha}"
+# Entité HEARTBEAT — époch (secondes) réécrit à CHAQUE passe saine (fetch OK), qu'il y
+# ait déploiement réel OU non. deployed_sha ne convient PAS comme signal de vivacité :
+# quand rien ne change, le deployer republie le MÊME SHA et input_text.set_value avec une
+# valeur identique NE rafraîchit ni last_updated ni last_reported (vérifié 2026-08-13) →
+# un watchdog basé sur son âge criait « silencieux » alors que la boucle tournait (faux
+# positif à chaque période >45 min sans déploiement, cas nominal). L'époch change à chaque
+# passe → l'état bouge → le watchdog peut mesurer un vrai âge « dernière passe saine ».
+HEARTBEAT_ENTITY="${HEARTBEAT_ENTITY:-input_text.git_deployer_heartbeat}"
 
 TMP="/tmp/git-deployer"
 
@@ -100,6 +108,19 @@ publish_deployed_sha() {
   fi
 }
 
+# publish_heartbeat — écrit l'époch courant dans HEARTBEAT_ENTITY. Appelé à CHAQUE passe
+# dès que le fetch a réussi (avant toute décision déployer/déjà-à-jour/conflit) : c'est le
+# signal « la boucle vit et joint bien github ». La valeur change à chaque passe → l'état
+# bouge → un watchdog peut mesurer l'âge réel de la dernière passe saine (voir la note sur
+# HEARTBEAT_ENTITY plus haut : deployed_sha, republié identique, ne rafraîchit aucun
+# timestamp). Best-effort — n'échoue jamais le déploiement.
+publish_heartbeat() {
+  local now; now="$(date -u +%s 2>/dev/null || echo 0)"
+  ha POST /services/input_text/set_value \
+     "{\"entity_id\":\"${HEARTBEAT_ENTITY}\",\"value\":\"${now}\"}" >/dev/null 2>&1 \
+     || bashio::log.warning "heartbeat non publié (${HEARTBEAT_ENTITY} absent ?)"
+}
+
 # yaml_dq VALUE — émet un scalaire YAML DOUBLE-QUOTÉ correctement échappé.
 # Indispensable pour `detail:` : sa valeur contient parfois un « : » littéral
 # (ex. « Rechargé: automation reload_all ») qui, non quoté, est lu comme un mapping
@@ -148,7 +169,8 @@ deploy_once() {
   fi
   git -C "$WORK_DIR" remote set-url origin "$REPO_URL"   # ne pas laisser le token dans .git/config
   new="$(git -C "$WORK_DIR" rev-parse HEAD)"
-  notify_clear   # connectivité git OK → efface toute notif d'échec d'une passe antérieure
+  notify_clear      # connectivité git OK → efface toute notif d'échec d'une passe antérieure
+  publish_heartbeat # passe saine (fetch OK) → rafraîchit le signal de vivacité lu par le watchdog
 
   if [ "$first_run" = 1 ]; then
     bashio::log.warning "PREMIER RUN — clone prêt, aucune application (pas de base de comparaison). Les prochains runs seront incrémentaux."
