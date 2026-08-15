@@ -56,6 +56,38 @@ ha() { # ha METHOD PATH [json]
   fi
 }
 
+# core_ready — l'API Core répond-elle ? `GET /` renvoie {"message":"API running."}
+# dès que Core sert des requêtes. Sonde bon marché, sans effet de bord.
+core_ready() { ha GET / >/dev/null 2>&1; }
+
+# wait_core_ready TRIES DELAY — attend que Core réponde. Une passe entière est
+# INUTILISABLE quand Core redémarre : on ne peut ni lire la base (deployed_sha),
+# ni valider (check_config), ni recharger. Pire, chacune de ces lectures échoue en
+# SILENCE et la passe part sur des valeurs de repli fausses.
+#
+# Vécu 2026-08-16 à 00h14 puis 00h18 (deux passes consécutives, pendant un
+# redémarrage de Core) : heartbeat non publié → base illisible → repli sur le HEAD
+# d'avant-fetch (la base empoisonnée qu'alpha.9 venait justement d'éliminer) →
+# 3 fichiers écrits → check_config injoignable, échec en 0 s (une vraie validation
+# prend ~60 s) → ROLLBACK. Deux ROLLBACK sans le moindre YAML invalide : le
+# `check_config` manuel rejoué à 00h20 répond `valid`. Coût : une fausse alerte au
+# watchdog (il déclenche sur ROLLBACK à 15 min) et un risque de perte silencieuse
+# par la base de repli.
+#
+# Donc : pas de Core, pas de passe. On saute proprement plutôt que d'en faire une
+# mauvaise. 20 essais × 15 s = 5 min de patience, très au-delà des ~3 min que met
+# un redémarrage de Core sur Yellow, et bien en deçà de l'intervalle de 900 s.
+wait_core_ready() {
+  local tries="${1:-20}" delay="${2:-15}" n=1
+  while ! core_ready; do
+    if [ "$n" -ge "$tries" ]; then return 1; fi
+    [ "$n" = 1 ] && bashio::log.warning "Core injoignable — attente (redémarrage en cours ?)"
+    sleep "$delay"; n=$(( n + 1 ))
+  done
+  [ "$n" = 1 ] || bashio::log.info "Core de nouveau joignable après $(( (n - 1) * delay ))s"
+  return 0
+}
+
 notify() { # notify TITLE MESSAGE
   local b
   b=$(printf '{"title":"%s","message":"%s","notification_id":"git_deployer"}' \
@@ -127,14 +159,23 @@ publish_deployed_sha() {
 #
 # deployed_sha n'est publié que sur un état /config cohérent : c'est la seule base
 # fiable, et elle est déjà écrite par cet addon. Repli sur FALLBACK (l'ancien
-# comportement) si l'entité est illisible ou pointe un commit absent du clone —
-# on ne veut jamais échouer un déploiement à cause de la lecture de la base.
+# comportement) si l'entité répond mais ne porte pas de SHA (amorçage : entité
+# fraîchement créée, jamais renseignée) ou pointe un commit absent du clone.
+#
+# En revanche, quand c'est l'API Core elle-même qui ne répond pas, le repli est un
+# PIÈGE : il fabrique une base fausse à partir d'un simple hoquet réseau, et c'est
+# exactement le mécanisme de perte silencieuse décrit ci-dessus. Ce cas rend 2 —
+# l'appelant abandonne la passe, sans rien écrire. Vécu 2026-08-16 (cf. wait_core_ready).
 resolve_base() {
-  local fallback="$1" sha
-  sha="$(ha GET "/states/${DEPLOYED_SHA_ENTITY}" 2>/dev/null \
+  local fallback="$1" sha raw
+  if ! raw="$(ha GET "/states/${DEPLOYED_SHA_ENTITY}" 2>/dev/null)"; then
+    bashio::log.warning "base : API Core injoignable pour lire ${DEPLOYED_SHA_ENTITY} → passe abandonnée (pas de repli : il produirait une base fausse)"
+    return 2
+  fi
+  sha="$(printf '%s' "$raw" \
          | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{7,40\}\)".*/\1/p')"
   if [ -z "$sha" ]; then
-    bashio::log.warning "base : ${DEPLOYED_SHA_ENTITY} illisible ou non-SHA → repli sur HEAD d'avant-fetch (${fallback:0:8})"
+    bashio::log.warning "base : ${DEPLOYED_SHA_ENTITY} lisible mais sans SHA (amorçage ?) → repli sur HEAD d'avant-fetch (${fallback:0:8})"
     printf '%s' "$fallback"; return 0
   fi
   if ! git -C "$WORK_DIR" cat-file -e "${sha}^{commit}" 2>/dev/null; then
@@ -176,7 +217,9 @@ yaml_dq() {
 # write_status RESULT SHA DETAIL — compte-rendu du dernier déploiement, lisible depuis
 # git SANS accès HA : écrit sous <config>/.deploy/last-run.yaml, donc snapshoté par
 # git-exporter au cycle suivant. Jamais redéployé (filtré dans la boucle d'application).
-# Best-effort. RESULT ∈ OK | CONFLICT | ROLLBACK. Voir ha-vallesvilles-family :
+# Best-effort. RESULT ∈ OK | CONFLICT | ROLLBACK | RETRY (Core injoignable pendant la
+# validation : rien de prouvé, fichiers remis en état, on retente — pas une anomalie de
+# config, donc volontairement hors du déclencheur du watchdog). Voir ha-vallesvilles-family :
 # docs/ops/deploy-status.md. Valeurs quotées (yaml_dq) pour garantir un YAML valide.
 write_status() {
   local dir="${CONFIG_DIR}/.deploy"
@@ -191,6 +234,14 @@ write_status() {
 
 deploy_once() {
   rm -rf "$TMP"; mkdir -p "$TMP"
+
+  # Rien ne se fait sans Core : lecture de la base, validation et reload passent tous
+  # par son API. Une passe menée sans lui écrit des fichiers qu'elle ne sait ni choisir
+  # ni valider (cf. wait_core_ready). On saute la passe — la suivante arrive dans 900 s.
+  if ! wait_core_ready; then
+    bashio::log.warning "Core toujours injoignable après 5 min — passe sautée (aucune écriture). Nouvelle tentative à la passe suivante."
+    return 0
+  fi
 
   local auth_url first_run=0 old new
   auth_url="$(printf '%s' "$REPO_URL" | sed "s#https://#https://${GIT_USER}:${GIT_PASS}@#")"
@@ -214,7 +265,12 @@ deploy_once() {
   # Base = ce que /config contient vraiment (deployed_sha), pas ce qu'on vient de
   # fetcher : le reset --hard ci-dessus a déjà avancé le clone, y compris quand la
   # passe précédente n'a rien appliqué. Voir resolve_base.
-  [ "$first_run" = 1 ] || old="$(resolve_base "$old")"
+  if [ "$first_run" != 1 ]; then
+    if ! old="$(resolve_base "$old")"; then
+      bashio::log.warning "passe abandonnée — base indéterminable (Core injoignable). Aucune écriture, on retente à la passe suivante."
+      return 0
+    fi
+  fi
 
   if [ "$first_run" = 1 ]; then
     bashio::log.warning "PREMIER RUN — clone prêt, aucune application (pas de base de comparaison). Les prochains runs seront incrémentaux."
@@ -312,9 +368,35 @@ deploy_once() {
     else mkdir -p "${CONFIG_DIR}/$(dirname "$rel")"; git -C "$WORK_DIR" show "${new}:${SUBDIR}/${rel}" > "$live" || { fail "écriture $rel"; return 1; }; bashio::log.info "écrit     $rel"; fi
   done < "$TMP/apply"
 
+  # Deux échecs très différents se cachaient derrière un seul ROLLBACK :
+  #   (a) Core répond « invalid » → le YAML déployé est réellement cassé. Alerte méritée.
+  #   (b) Core ne répond pas du tout → on ne sait RIEN de la validité. L'ancien code
+  #       repliait sur {"result":"error"} et criait « config invalide », ce qui est un
+  #       mensonge : les deux ROLLBACK du 2026-08-16 (00h14, 00h18) portaient sur une
+  #       config que check_config a déclarée `valid` deux minutes plus tard.
+  # Le cas (b) se retente : 3 essais espacés, puis remise en état + statut RETRY, qui
+  # ne réveille pas le watchdog (il ne déclenche que sur CONFLICT/ROLLBACK). La passe
+  # suivante réappliquera, Core revenu.
   bashio::log.info "validation check_config…"
-  local check result
-  check="$(ha POST /config/core/check_config '{}' 2>/dev/null || printf '{"result":"error"}')"
+  local check result n=1
+  while :; do
+    if check="$(ha POST /config/core/check_config '{}' 2>/dev/null)"; then break; fi
+    if [ "$n" -ge 3 ]; then check=""; break; fi
+    bashio::log.warning "check_config injoignable (tentative ${n}/3) — Core redémarre ? réessai dans 20s"
+    sleep 20; n=$(( n + 1 ))
+  done
+
+  if [ -z "$check" ]; then
+    bashio::log.warning "check_config injoignable après 3 tentatives → remise en état (rien de prouvé sur la validité)"
+    local st
+    while IFS=$'\t' read -r st rel; do
+      [ -n "$rel" ] || continue; live="${CONFIG_DIR}/${rel}"
+      if [ "$st" = "E" ]; then cp "$BK/$rel" "$live"; else rm -f "$live"; fi
+    done < "$TMP/applied"
+    write_status RETRY "$new" "Core injoignable — validation impossible, fichiers remis en état, retente à la passe suivante"
+    return 0
+  fi
+
   result="$(printf '%s' "$check" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')"
   if [ "$result" != "valid" ]; then
     bashio::log.error "check_config=${result:-inconnu} → ROLLBACK"

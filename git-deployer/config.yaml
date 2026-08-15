@@ -1,5 +1,5 @@
 name: Git Deployer (git → HA)
-version: "0.1.0-alpha.9"
+version: "0.1.0-alpha.10"
 slug: git-deployer
 image: "ghcr.io/beennnn/git-deployer-{arch}"
 description: >-
