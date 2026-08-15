@@ -108,6 +108,45 @@ publish_deployed_sha() {
   fi
 }
 
+# resolve_base FALLBACK — renvoie le SHA que /config contient RÉELLEMENT, à utiliser
+# comme base du diff `old..new` et de la garde anti-écrasement.
+#
+# La base doit être le dernier SHA effectivement APPLIQUÉ, jamais le dernier SHA
+# FETCHÉ. Les deux divergent dès qu'une passe n'applique rien (conflit, dry_run,
+# échec après reset) : `git reset --hard` avance le clone de travail quoi qu'il
+# arrive, donc « HEAD d'avant-fetch » surestime ce que /config contient.
+#
+# Deux dégâts observés en production (ha-vallesvilles-family, 2026-08-08 → 08-15,
+# 7 jours de gel) :
+#   1. perte silencieuse — les fichiers d'une passe en CONFLIT sortaient du diff de
+#      la passe suivante (leur cible était devenue la base) et n'étaient PLUS JAMAIS
+#      déployés, sans qu'aucune erreur ne le signale ;
+#   2. conflit fantôme auto-entretenu — `old:<fichier>` ne correspondant plus au live,
+#      la garde criait « modifiée en live » sur des fichiers que personne n'avait
+#      touchés, à chaque passe, indéfiniment.
+#
+# deployed_sha n'est publié que sur un état /config cohérent : c'est la seule base
+# fiable, et elle est déjà écrite par cet addon. Repli sur FALLBACK (l'ancien
+# comportement) si l'entité est illisible ou pointe un commit absent du clone —
+# on ne veut jamais échouer un déploiement à cause de la lecture de la base.
+resolve_base() {
+  local fallback="$1" sha
+  sha="$(ha GET "/states/${DEPLOYED_SHA_ENTITY}" 2>/dev/null \
+         | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{7,40\}\)".*/\1/p')"
+  if [ -z "$sha" ]; then
+    bashio::log.warning "base : ${DEPLOYED_SHA_ENTITY} illisible ou non-SHA → repli sur HEAD d'avant-fetch (${fallback:0:8})"
+    printf '%s' "$fallback"; return 0
+  fi
+  if ! git -C "$WORK_DIR" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    bashio::log.warning "base : deployed_sha ${sha:0:8} absent du clone (branche réécrite ?) → repli sur HEAD d'avant-fetch (${fallback:0:8})"
+    printf '%s' "$fallback"; return 0
+  fi
+  if [ "$sha" != "$fallback" ]; then
+    bashio::log.info "base : deployed_sha ${sha:0:8} (HEAD d'avant-fetch ${fallback:0:8} — passe(s) précédente(s) sans application)"
+  fi
+  printf '%s' "$sha"
+}
+
 # publish_heartbeat — écrit l'époch courant dans HEARTBEAT_ENTITY. Appelé à CHAQUE passe
 # dès que le fetch a réussi (avant toute décision déployer/déjà-à-jour/conflit) : c'est le
 # signal « la boucle vit et joint bien github ». La valeur change à chaque passe → l'état
@@ -171,6 +210,11 @@ deploy_once() {
   new="$(git -C "$WORK_DIR" rev-parse HEAD)"
   notify_clear      # connectivité git OK → efface toute notif d'échec d'une passe antérieure
   publish_heartbeat # passe saine (fetch OK) → rafraîchit le signal de vivacité lu par le watchdog
+
+  # Base = ce que /config contient vraiment (deployed_sha), pas ce qu'on vient de
+  # fetcher : le reset --hard ci-dessus a déjà avancé le clone, y compris quand la
+  # passe précédente n'a rien appliqué. Voir resolve_base.
+  [ "$first_run" = 1 ] || old="$(resolve_base "$old")"
 
   if [ "$first_run" = 1 ]; then
     bashio::log.warning "PREMIER RUN — clone prêt, aucune application (pas de base de comparaison). Les prochains runs seront incrémentaux."
