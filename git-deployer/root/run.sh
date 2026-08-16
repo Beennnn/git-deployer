@@ -9,6 +9,8 @@
 #   - backup HA complet avant écriture ;
 #   - check_config après écriture → rollback si invalide ;
 #   - reload ciblé (automation/script/scene) ; restart suggéré si structurant ;
+#   - redémarrage de HA quand la passe touche l'intégration `rest`, que le
+#     rechargement n'applique PAS (cf. bloc « Redémarrage HA … » plus bas) ;
 #   - 1er run = clone puis stop (pas d'application sans base de comparaison).
 #
 # Auth : parle à l'API core HA via le jeton Supervisor de l'addon
@@ -24,6 +26,13 @@ DRY_RUN="$(bashio::config 'deploy.dry_run')"
 ALLOW_PARTIAL="$(bashio::config 'deploy.allow_partial')"
 BACKUP_BEFORE="$(bashio::config 'deploy.backup_before')"
 INTERVAL="$(bashio::config 'deploy.interval')"
+RESTART_ON_REST="$(bashio::config 'deploy.restart_on_rest')"
+RESTART_MIN_INTERVAL="$(bashio::config 'deploy.restart_min_interval')"
+# Repli explicite : sur une install ANTÉRIEURE à ces deux options, le Superviseur
+# complète normalement avec les défauts de config.yaml — mais si la clé remonte
+# vide/`null`, le comportement doit rester celui qu'on documente, pas « désactivé ».
+case "$RESTART_ON_REST" in true|false) ;; *) RESTART_ON_REST=true ;; esac
+case "$RESTART_MIN_INTERVAL" in ''|*[!0-9]*) RESTART_MIN_INTERVAL=3600 ;; esac
 
 # Défauts prod ; surchargeables par env (utile pour les tests hors Supervisor).
 CONFIG_DIR="${CONFIG_DIR:-/config}"
@@ -50,6 +59,22 @@ BK="$TMP/rollback"
 # retarder — au-delà, c'est que le déployeur est arrêté depuis des semaines et le
 # diagnostic « modifié en live » redevient l'hypothèse honnête.
 KNOWN_DEPTH=200
+
+# État du redémarrage, dans /data (persistant : il doit survivre à un arrêt de l'add-on,
+# sinon un besoin de redémarrage mémorisé serait perdu à la première mise à jour).
+#   RESTART_OWED_FILE  — existe ⇔ un redémarrage est DÛ et pas encore fait (contient la raison)
+#   RESTART_LAST_FILE  — époch du dernier redémarrage demandé par cet add-on (étranglement)
+# Surchargeables par env pour les tests hors Supervisor.
+RESTART_OWED_FILE="${RESTART_OWED_FILE:-/data/restart-owed}"
+RESTART_LAST_FILE="${RESTART_LAST_FILE:-/data/restart-last-epoch}"
+
+# Les deux dialectes qui déclarent du `rest` dans un fichier déployé :
+#   - `- platform: rest`  → dialecte capteur (config/sensor.yaml) ;
+#   - `rest:` en colonne 0 → clé d'intégration (configuration.yaml, un package).
+# `rest.yaml` lui-même ne contient NI l'un NI l'autre (son contenu est la valeur de la clé) :
+# il est reconnu par son nom, pas par ce motif. Ancré en colonne 0 pour la clé, afin qu'une
+# clé `rest:` imbriquée dans une autre intégration ne déclenche pas de redémarrage inutile.
+REST_DECL_RE='^[[:space:]]*-?[[:space:]]*platform:[[:space:]]*rest([[:space:]]|#|$)|^rest:([[:space:]]|$)'
 
 jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g'; }
 
@@ -237,6 +262,89 @@ write_status() {
     printf 'sha: %s\n'       "$(yaml_dq "${2:-}")"
     printf 'detail: %s\n'    "$(yaml_dq "${3:-}")"
   } > "$dir/last-run.yaml" 2>/dev/null || true
+}
+
+# --- Redémarrage HA après un déploiement `rest` -------------------------------------
+#
+# POURQUOI. `homeassistant.reload_all` suffit pour les automations, scripts, scènes et
+# templates — PAS pour l'intégration `rest`. Son rechargement recrée ses entités SANS avoir
+# retiré les précédentes : les nouvelles sont toutes rejetées (« ID … already exists -
+# ignoring ») et l'ANCIENNE configuration reste en service. Bug amont fermé « not planned » :
+# https://github.com/home-assistant/core/issues/93527
+#
+# Sans ce garde-fou, une PR touchant `rest.yaml` est mergée, déployée, `deployed_sha` à
+# jour… et sans effet jusqu'au prochain redémarrage : un no-op SILENCIEUX, exactement ce
+# qu'un déployeur ne doit jamais produire. Mesuré côté ha-vallesvilles-family (PR #232) :
+# un `rest.reload` produit 44 lignes d'erreur — une salve complète par rechargement, zéro
+# au démarrage. C'est bien le rechargement qui échoue, pas la déclaration.
+#
+# LE COÛT, ET POURQUOI IL EST BORNÉ. Un redémarrage de Core, c'est ~1 min d'indisponibilité.
+# `restart_min_interval` (1 h par défaut) empêche une boucle de 15 min de redémarrer HA à
+# répétition. Mais l'étranglement seul RECRÉERAIT le no-op qu'il doit supprimer : la passe
+# suivante n'a plus rien à déployer, donc plus rien qui redemande le redémarrage. D'où la
+# mémoire sur disque — le besoin est noté, puis honoré dès que le créneau s'ouvre.
+
+# request_restart REASON — note qu'un redémarrage est dû. N'en déclenche aucun : c'est
+# maybe_restart, appelée APRÈS la passe, qui décide (une passe ne doit pas se saborder en
+# coupant le Core dont elle a encore besoin).
+request_restart() {
+  printf '%s\n' "$1" > "$RESTART_OWED_FILE" 2>/dev/null \
+    || bashio::log.warning "besoin de redémarrage non mémorisé (${RESTART_OWED_FILE} non inscriptible)"
+}
+
+# rest_touched OLD NEW — la passe touche-t-elle la configuration de l'intégration `rest` ?
+# Lit $TMP/apply (les fichiers réellement appliqués, pas le diff brut).
+# On teste la version NOUVELLE **et** l'ANCIENNE : retirer un capteur `rest` exige autant
+# un redémarrage que d'en ajouter un, puisque le rechargement ne retire rien non plus.
+# Écriture dans un fichier plutôt qu'un pipe vers grep : `git show` échoue quand le chemin
+# n'existe pas d'un côté (cas normal d'un ajout ou d'une suppression) et `pipefail` ferait
+# alors passer le test pour faux même lorsque grep a trouvé.
+rest_touched() {
+  local old="$1" new="$2" op rel
+  while IFS=$'\t' read -r op rel; do
+    [ -n "$rel" ] || continue
+    case "${rel##*/}" in rest.yaml|rest.yml) return 0 ;; esac
+    : > "$TMP/rest_scan"
+    git -C "$WORK_DIR" show "${new}:${SUBDIR}/${rel}" >> "$TMP/rest_scan" 2>/dev/null || true
+    git -C "$WORK_DIR" show "${old}:${SUBDIR}/${rel}" >> "$TMP/rest_scan" 2>/dev/null || true
+    if grep -qE "$REST_DECL_RE" "$TMP/rest_scan"; then return 0; fi
+  done < "$TMP/apply"
+  return 1
+}
+
+# maybe_restart — honore un redémarrage dû, si le créneau est ouvert et Core joignable.
+# Appelée après CHAQUE passe, y compris celles qui n'ont rien déployé : c'est ce qui permet
+# à un redémarrage différé d'avoir quand même lieu.
+maybe_restart() {
+  [ -s "$RESTART_OWED_FILE" ] || return 0
+  local reason now last age
+  reason="$(head -n1 "$RESTART_OWED_FILE" 2>/dev/null || echo 'fichier REST déployé')"
+  now="$(date -u +%s 2>/dev/null || echo 0)"
+  last="$(cat "$RESTART_LAST_FILE" 2>/dev/null || echo 0)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  age=$(( now - last ))
+
+  if [ "$last" -gt 0 ] && [ "$age" -lt "$RESTART_MIN_INTERVAL" ]; then
+    bashio::log.warning "redémarrage HA dû (${reason}) mais DIFFÉRÉ — dernier il y a $(( age / 60 )) min, minimum $(( RESTART_MIN_INTERVAL / 60 )) min. Honoré dès le créneau ouvert."
+    notify "⏳ git-deployer — redémarrage différé" "${reason}. La configuration REST déployée n'est PAS encore active : redémarrage dans $(( (RESTART_MIN_INTERVAL - age + 59) / 60 )) min."
+    return 0
+  fi
+  if ! core_ready; then
+    bashio::log.warning "redémarrage HA dû (${reason}) mais Core injoignable — reporté à la passe suivante"
+    return 0
+  fi
+
+  # Marqué AVANT l'appel, volontairement : `homeassistant/restart` coupe Core en pleine
+  # réponse, donc curl peut très bien rendre un échec alors que le redémarrage a bien eu
+  # lieu. Marquer après ferait boucler l'add-on sur un redémarrage toutes les 15 min — une
+  # panne bien pire que celle qu'on corrige. Le prochain déploiement REST réarmera le
+  # besoin de toute façon.
+  printf '%s\n' "$now" > "$RESTART_LAST_FILE" 2>/dev/null || true
+  rm -f "$RESTART_OWED_FILE"
+  bashio::log.info "redémarrage de HA (${reason}) — le rechargement ne suffit pas pour l'intégration rest"
+  notify "🔁 git-deployer — redémarrage de HA" "${reason}. Core revient dans ~1 min."
+  ha POST /services/homeassistant/restart '{}' >/dev/null 2>&1 \
+    || bashio::log.info "pas de réponse à homeassistant/restart — attendu, Core coupe pendant l'appel"
 }
 
 # find_known_commit TIP PATH LIVE — le contenu live de PATH est-il, octet pour octet, la
@@ -526,7 +634,16 @@ deploy_once() {
     reload_plan="${reload_plan} reload_all"
   fi
 
-  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reload_plan}."
+  # `rest` ne se recharge pas : on NOTE le besoin de redémarrage ici, maybe_restart l'honore
+  # après la passe. Les reloads ci-dessous restent faits dans tous les cas — ils portent les
+  # AUTRES fichiers de la passe, et le redémarrage, lui, peut être différé d'une heure.
+  local rest_note=""
+  if [ "$RESTART_ON_REST" = "true" ] && rest_touched "$old" "$new"; then
+    rest_note=" Intégration rest touchée → redémarrage de HA requis (le rechargement ne l'applique pas)."
+    request_restart "déploiement ${new:0:8} touchant l'intégration rest"
+  fi
+
+  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reload_plan}.${rest_note}"
   if [ "$nb_repr" -gt 0 ]; then msg="${msg} Dont ${nb_repr} repris après passe interrompue."; fi
   bashio::log.info "OK — $msg"
 
@@ -565,12 +682,20 @@ fi
 
 bashio::log.info "git-deployer — dépôt=${REPO_URL} branche=${BRANCH} sous-dossier=${SUBDIR}"
 
+# maybe_restart est appelée APRÈS la passe, jamais pendant : couper Core au milieu d'une
+# passe la priverait de la lecture de base, de check_config et des reloads. Et elle est
+# appelée à CHAQUE passe, y compris celles qui n'ont rien déployé — c'est ainsi qu'un
+# redémarrage différé par l'étranglement finit par avoir lieu.
 if [ "${INTERVAL:-0}" -gt 0 ]; then
   bashio::log.info "mode boucle : une passe toutes les ${INTERVAL}s"
   while true; do
     deploy_once || bashio::log.warning "passe en échec — on continue"
+    maybe_restart
     sleep "${INTERVAL}"
   done
 else
-  deploy_once
+  rc=0
+  deploy_once || rc=$?
+  maybe_restart
+  exit "$rc"
 fi

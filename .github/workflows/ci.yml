@@ -21,3 +21,12 @@ jobs:
         with:
           dockerfile: git-deployer/Dockerfile
           failure-threshold: error
+
+  # Pilote le VRAI run.sh sur un dépôt jetable, `bashio` et l'API HA simulés — aucune
+  # instance Home Assistant requise, donc ça tourne sur un runner nu.
+  functional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: redémarrage HA sur déploiement REST
+        run: bash tests/test_restart_on_rest.sh

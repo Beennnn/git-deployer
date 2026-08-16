@@ -32,6 +32,13 @@ with real safety rails, not a blind overwrite:
 - **`check_config` after** writing → **automatic rollback** if the result is invalid.
 - **Targeted reload** (`automation` / `script` / `scene`); a restart is only
   suggested when a structural file changed (`configuration.yaml`, `packages/`).
+- **Restarts HA when a reload would be a lie** — the `rest` integration cannot be
+  reloaded ([core#93527](https://github.com/home-assistant/core/issues/93527)): its
+  entities are recreated *before* the old ones are removed, so the new config is
+  rejected and the **old one keeps running**. Deploying `rest.yaml` with a reload
+  alone is a **silent no-op**. Such a pass triggers `homeassistant/restart`,
+  throttled (`restart_min_interval`) and **remembered on disk** so a held-back
+  restart still happens on a later pass.
 - **First run clones and stops** (no apply without a comparison base).
 - Talks to Home Assistant through the **add-on's Supervisor token** — no
   long-lived token to create by hand.
@@ -62,7 +69,7 @@ truth, fed both ways but reconciled at the PR, never in silence.
 | Protects un-committed live edits | ✗ (git wins, overwrites) | n/a | ✅ **per-file anti-clobber guard** |
 | Backup before applying | ✗ | n/a | ✅ full HA backup |
 | Invalid config after apply | leaves files, just skips restart | n/a | ✅ **rolls back** the applied files |
-| Reload granularity | full restart | n/a | ✅ targeted reload, restart only if structural |
+| Reload granularity | full restart | n/a | ✅ targeted reload, restart when structural **or `rest`** |
 | Runs beside a snapshot flow | conflicts (both own `/config`) | — | ✅ **built to complement** git-exporter |
 
 **In short:** the official *Git pull* add-on implements pure GitOps (git owns
@@ -84,6 +91,8 @@ deploy:
   allow_partial: false         # true = apply non-conflicting files even if others conflict
   backup_before: true          # full HA backup before writing
   interval: 0                  # 0 = one pass then stop; >0 = loop every N seconds
+  restart_on_rest: true        # restart HA when the pass touches the `rest` integration
+  restart_min_interval: 3600   # min seconds between restarts (a held-back one is remembered)
 ```
 
 Trigger it on a schedule the same way `git-exporter` is triggered — an HA

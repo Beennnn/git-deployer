@@ -27,8 +27,27 @@ for the full rationale and comparison with other add-ons.
    *before* the reload on purpose: `reload_all` refreshes the `command_line` sensor
    that reads it, so writing after would make that sensor publish the **previous**
    result until its next poll (5 min by default).
+8. **Restart when the pass touches the `rest` integration** — see below.
 
 The first run clones and **stops** (no apply without a comparison base).
+
+## Why a `rest` deploy triggers a restart
+
+Reloading the `rest` integration recreates its entities **without having removed the
+previous ones**: the new ones are all rejected (`ID … already exists - ignoring`) and the
+**old configuration stays in service** — upstream bug closed as *not planned*
+([home-assistant/core#93527](https://github.com/home-assistant/core/issues/93527)).
+
+So a reload-only deploy of `rest.yaml` is a **silent no-op**: merged, written,
+`deployed_sha` up to date, and with no effect until the next restart. The add-on therefore
+calls `homeassistant/restart` when the applied files include `rest.yaml`, a `- platform:
+rest` entry, or a top-level `rest:` key.
+
+A restart costs ~1 min of downtime, so it is throttled by `restart_min_interval`. A restart
+held back by that throttle is **remembered on disk and performed on a later pass** — without
+that memory the throttle would recreate the very no-op it exists to prevent, since the next
+pass has nothing left to deploy. Set `restart_on_rest: false` to opt out entirely (you then
+own the restart yourself).
 
 ## Options
 
@@ -43,6 +62,8 @@ The first run clones and **stops** (no apply without a comparison base).
 | `deploy.allow_partial` | `false` | Apply non-conflicting files even if others conflict |
 | `deploy.backup_before` | `true` | Full HA backup before writing |
 | `deploy.interval` | `0` | `0` = one pass then stop; `>0` = loop every N seconds |
+| `deploy.restart_on_rest` | `true` | Restart HA when the pass touches the `rest` integration (a reload does not apply it) |
+| `deploy.restart_min_interval` | `3600` | Minimum seconds between two restarts; a held-back restart is remembered, not dropped |
 
 ## Authentication
 
