@@ -21,6 +21,13 @@ with real safety rails, not a blind overwrite:
   `/config` equals the *previous* git version. If it was hand-edited in the HA UI
   and not yet captured, that's a **conflict** → nothing is written (all-or-nothing)
   and you get a notification. **No silent loss of a live edit.**
+- **Tells an interrupted pass apart from a hand edit** — when the live content
+  differs from the expected base but is, byte for byte, the version from *another*
+  commit, nobody typed it: an earlier pass stopped halfway. That file is **resumed**
+  and logged as such, instead of being blamed on a human and freezing the chain.
+- **All-or-nothing writes** — a failed write, or the add-on being stopped mid-pass,
+  restores every file the pass had already touched. `/config` is never left in a
+  state that matches no commit.
 - **Full HA backup before** any write.
 - **`check_config` after** writing → **automatic rollback** if the result is invalid.
 - **Targeted reload** (`automation` / `script` / `scene`); a restart is only
