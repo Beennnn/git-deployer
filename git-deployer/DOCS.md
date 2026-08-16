@@ -55,7 +55,7 @@ own the restart yourself).
 |---|---|---|
 | `repository.url` | — | HTTPS clone URL of your config repo |
 | `repository.username` | — | GitHub username |
-| `repository.password` | — | PAT with **read** access to the repo |
+| `repository.password` | — | PAT with **read** access to the repo — see [Keeping the token out of the options](#keeping-the-token-out-of-the-options) |
 | `repository.branch` | `main` | Branch to deploy |
 | `deploy.subdir` | `config` | Repo subfolder that maps to `/config` |
 | `deploy.dry_run` | `false` | Show the plan, write nothing |
@@ -70,6 +70,41 @@ own the restart yourself).
 The add-on talks to Home Assistant through its **Supervisor token** — you do **not**
 create a long-lived token. You only provide the git read credential
 (`repository.password`).
+
+### Keeping the token out of the options
+
+Supervisor stores add-on options **in clear text**, and hands them back in clear text
+to *any* API call — `ha apps info <slug> --raw-json` and the REST endpoint behind it.
+The `password:` schema type only masks the field in the UI; it protects nothing on the
+API side. So a routine diagnostic is enough to copy your PAT into a log, a screenshot
+or a chat transcript, after which the token has to be revoked. That is not a
+hypothetical: it happened here on 2026-08-16.
+
+Point the option at a key instead of pasting the token:
+
+```yaml
+# /config/secrets.yaml — never leaves the machine, and is git-ignored
+github_pat_deployer: github_pat_11ABCDEF…
+```
+
+```yaml
+# add-on options — this is all the API can ever hand back now
+repository:
+  password: "!secret github_pat_deployer"
+```
+
+Anything starting with `!secret ` is read from `/config/secrets.yaml` at startup;
+anything else is used as-is, so **existing setups keep working untouched** and you can
+switch one option at a time. The resolved value is never logged, not even on failure —
+errors name the *key*, which is what tells a typo apart from a revoked token.
+
+Two things worth knowing:
+
+- **Upgrade first, switch the option second.** This add-on is the one that deploys, so
+  an option pointing at `!secret` on a version that cannot read it would break the very
+  loop you would need to fix it.
+- `secrets.yaml` is only readable because the add-on already mounts `/config`. Nothing
+  new is exposed, and Supervisor never serves that file over its API.
 
 ## Triggering
 

@@ -83,7 +83,10 @@ the deploy is non-destructive, validated, and reversible.
 repository:
   url: "https://github.com/you/your-ha-config.git"
   username: "your-github-user"
-  password: "ghp_xxx"          # PAT with READ access to the (private) repo
+  password: "!secret github_pat_deployer"   # key of /config/secrets.yaml — see below.
+                               # A raw PAT still works, but Supervisor hands options
+                               # back in clear text to any API call, so it leaks on
+                               # the first routine diagnostic.
   branch: "main"
 deploy:
   subdir: "config"             # repo subfolder that maps to /config
@@ -98,6 +101,26 @@ deploy:
 Trigger it on a schedule the same way `git-exporter` is triggered — an HA
 automation calling `hassio.addon_start` on this add-on — or set `interval` to run
 its own loop.
+
+### Keep the PAT out of the options
+
+Supervisor stores add-on options in clear text and returns them in clear text to
+**any** API call (`ha apps info <slug> --raw-json` and the REST endpoint behind it) —
+the `password:` schema type only masks the field in the UI. One routine diagnostic is
+therefore enough to leak the token into a log or a transcript.
+
+Put the token in `/config/secrets.yaml` and reference it by name:
+
+```yaml
+# /config/secrets.yaml
+github_pat_deployer: github_pat_11ABCDEF…
+```
+
+Any option value starting with `!secret ` is resolved from that file at startup; every
+other value is used as-is, so existing setups keep working and you can switch one
+option at a time. **Upgrade the add-on before switching the option** — this is the
+add-on that deploys, so a `!secret` value on a version that cannot read it would break
+the loop you would need to fix it. Full details in [DOCS.md](git-deployer/DOCS.md).
 
 ## Installation
 

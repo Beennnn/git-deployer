@@ -32,3 +32,5 @@ jobs:
         run: bash tests/test_restart_on_rest.sh
       - name: déclencheur « passe maintenant »
         run: bash tests/test_run_now_trigger.sh
+      - name: indirection « !secret » vers secrets.yaml
+        run: bash tests/test_secret_indirection.sh
