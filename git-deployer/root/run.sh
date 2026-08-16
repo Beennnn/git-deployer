@@ -1,8 +1,15 @@
 #!/usr/bin/env bashio
 # git-deployer — applique une branche git sur /config (le pendant « déploie »
-# de git-exporter). Port bashio du script bin/deploy/deploy-from-git.sh (testé).
+# de git-exporter).
 #
-# Sûr par conception (identique au script de référence) :
+# Né comme port bashio de bin/deploy/deploy-from-git.sh (ha-vallesvilles-family). Ce
+# script de référence a été RETIRÉ le 2026-08-16 : il avait divergé de quatre correctifs
+# nés d'incidents réels (wait_core_ready, application tout-ou-rien, find_known_commit,
+# redémarrage sur déploiement rest) tout en gardant la seule suite de tests — le filet
+# de sécurité couvrait la version que plus personne n'exécutait. Il n'y a désormais
+# qu'une implémentation, et les tests de tests/ pilotent CELLE-CI.
+#
+# Sûr par conception :
 #   - ne déploie que <subdir>/**  (par défaut config/) ;
 #   - garde anti-écrasement : n'applique un fichier que si la version live == la
 #     version git précédente (sinon CONFLIT → tout-ou-rien → rien écrit + notif) ;
