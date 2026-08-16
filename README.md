@@ -28,10 +28,17 @@ with real safety rails, not a blind overwrite:
 - **All-or-nothing writes** — a failed write, or the add-on being stopped mid-pass,
   restores every file the pass had already touched. `/config` is never left in a
   state that matches no commit.
-- **Full HA backup before** any write.
+- **Full HA backup before** any write — throttled to one a day by default: a full
+  archive is ~1.6 GB and ~4 min of disk thrash, and a pass is already reversible
+  without it (per-file copy + `check_config` + rollback).
 - **`check_config` after** writing → **automatic rollback** if the result is invalid.
-- **Targeted reload** (`automation` / `script` / `scene`); a restart is only
-  suggested when a structural file changed (`configuration.yaml`, `packages/`).
+- **Reloads only the domains the pass touched.** `reload_all` reloads *every*
+  integration at once — measured at **77 s of frozen event loop**, long enough for
+  the MQTT client to drop and take the whole Zigbee2MQTT fleet `unavailable` with it
+  (20 times in one day). Deploying `automations.yaml` now calls `automation.reload`
+  and nothing else; `dashboards/**` reloads nothing at all. Any file the table
+  cannot name falls back to the full reload — a needless reload costs a freeze, a
+  *missed* one costs a silent no-op.
 - **Restarts HA when a reload would be a lie** — the `rest` integration cannot be
   reloaded ([core#93527](https://github.com/home-assistant/core/issues/93527)): its
   entities are recreated *before* the old ones are removed, so the new config is
@@ -67,9 +74,9 @@ truth, fed both ways but reconciled at the PR, never in silence.
 | Repo layout | requires `/config` == **repo root** | any | **subfolder mapping** (`config/` → `/config`) |
 | First-run behaviour | **deletes** non-matching `/config` content | n/a | clones & **stops**, applies nothing |
 | Protects un-committed live edits | ✗ (git wins, overwrites) | n/a | ✅ **per-file anti-clobber guard** |
-| Backup before applying | ✗ | n/a | ✅ full HA backup |
+| Backup before applying | ✗ | n/a | ✅ full HA backup, throttled |
 | Invalid config after apply | leaves files, just skips restart | n/a | ✅ **rolls back** the applied files |
-| Reload granularity | full restart | n/a | ✅ targeted reload, restart when structural **or `rest`** |
+| Reload granularity | full restart | n/a | ✅ per-domain reload, full reload only when needed, restart on `rest` |
 | Runs beside a snapshot flow | conflicts (both own `/config`) | — | ✅ **built to complement** git-exporter |
 
 **In short:** the official *Git pull* add-on implements pure GitOps (git owns
@@ -93,6 +100,7 @@ deploy:
   dry_run: false               # true = show the plan, write nothing
   allow_partial: false         # true = apply non-conflicting files even if others conflict
   backup_before: true          # full HA backup before writing
+  backup_min_interval: 86400   # min seconds between two full backups (0 = one per pass)
   interval: 0                  # 0 = one pass then stop; >0 = loop every N seconds
   restart_on_rest: true        # restart HA when the pass touches the `rest` integration
   restart_min_interval: 3600   # min seconds between restarts (a held-back one is remembered)

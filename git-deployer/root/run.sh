@@ -13,9 +13,11 @@
 #   - ne déploie que <subdir>/**  (par défaut config/) ;
 #   - garde anti-écrasement : n'applique un fichier que si la version live == la
 #     version git précédente (sinon CONFLIT → tout-ou-rien → rien écrit + notif) ;
-#   - backup HA complet avant écriture ;
+#   - backup HA complet avant écriture, étranglé (cf. maybe_backup — un backup complet
+#     coûte ~4 min d'écriture disque, la réversibilité d'une passe ne dépend pas de lui) ;
 #   - check_config après écriture → rollback si invalide ;
-#   - reload ciblé (automation/script/scene) ; restart suggéré si structurant ;
+#   - rechargement des SEULS domaines touchés (cf. reload_service_for — `reload_all` gèle
+#     Core assez longtemps pour faire décrocher MQTT, donc tout Zigbee2MQTT) ;
 #   - redémarrage de HA quand la passe touche l'intégration `rest`, que le
 #     rechargement n'applique PAS (cf. bloc « Redémarrage HA … » plus bas) ;
 #   - 1er run = clone puis stop (pas d'application sans base de comparaison).
@@ -129,6 +131,7 @@ SUBDIR="$(bashio::config 'deploy.subdir')"
 DRY_RUN="$(bashio::config 'deploy.dry_run')"
 ALLOW_PARTIAL="$(bashio::config 'deploy.allow_partial')"
 BACKUP_BEFORE="$(bashio::config 'deploy.backup_before')"
+BACKUP_MIN_INTERVAL="$(bashio::config 'deploy.backup_min_interval')"
 INTERVAL="$(bashio::config 'deploy.interval')"
 RESTART_ON_REST="$(bashio::config 'deploy.restart_on_rest')"
 RESTART_MIN_INTERVAL="$(bashio::config 'deploy.restart_min_interval')"
@@ -137,6 +140,10 @@ RESTART_MIN_INTERVAL="$(bashio::config 'deploy.restart_min_interval')"
 # vide/`null`, le comportement doit rester celui qu'on documente, pas « désactivé ».
 case "$RESTART_ON_REST" in true|false) ;; *) RESTART_ON_REST=true ;; esac
 case "$RESTART_MIN_INTERVAL" in ''|*[!0-9]*) RESTART_MIN_INTERVAL=3600 ;; esac
+# Même repli que ci-dessus : sur une install antérieure à cette option, la clé peut
+# remonter vide — le défaut documenté (24 h) doit s'appliquer, pas « 0 » qui rétablirait
+# un backup complet à chaque passe.
+case "$BACKUP_MIN_INTERVAL" in ''|*[!0-9]*) BACKUP_MIN_INTERVAL=86400 ;; esac
 
 # Défauts prod ; surchargeables par env (utile pour les tests hors Supervisor).
 CONFIG_DIR="${CONFIG_DIR:-/config}"
@@ -178,6 +185,9 @@ KNOWN_DEPTH=200
 # Surchargeables par env pour les tests hors Supervisor.
 RESTART_OWED_FILE="${RESTART_OWED_FILE:-/data/restart-owed}"
 RESTART_LAST_FILE="${RESTART_LAST_FILE:-/data/restart-last-epoch}"
+# Époch du dernier backup complet demandé par cet add-on (étranglement — cf. maybe_backup).
+# Dans /data pour la même raison : un redémarrage de l'add-on ne doit pas rouvrir le créneau.
+BACKUP_LAST_FILE="${BACKUP_LAST_FILE:-/data/backup-last-epoch}"
 
 # Les deux dialectes qui déclarent du `rest` dans un fichier déployé :
 #   - `- platform: rest`  → dialecte capteur (config/sensor.yaml) ;
@@ -585,6 +595,144 @@ restore_applied() {
   done < "$TMP/applied"
 }
 
+# --- Backup complet : un filet, pas un péage à chaque passe --------------------------
+#
+# POURQUOI L'ÉTRANGLEMENT. `hassio.backup_full` produit une archive de TOUT (config,
+# volumes des add-ons, share, media). Sur ha-vallesvilles-family c'est ~1,6 Go et
+# **3 min 45 s** par appel, mesuré sur 41 passes du 2026-08-16 : 144 minutes cumulées
+# d'écriture disque intensive dans la journée, pour protéger l'écriture de quelques
+# fichiers YAML. Pendant ces fenêtres, Core rame — délais dépassés sur les capteurs
+# Shelly, et deux passes ont vu `check_config` devenir injoignable (donc ROLLBACK) alors
+# que la configuration était valide.
+#
+# Ces archives ne servaient d'ailleurs presque jamais : l'add-on de sauvegarde Google
+# Drive purge les anciennes, et 2 seulement des 41 existaient encore le soir même.
+#
+# CE QU'ON NE PERD PAS. La réversibilité d'une passe ne repose PAS sur ce backup : chaque
+# fichier touché est copié dans $BK avant écriture, `check_config` valide après, et
+# `restore_applied` remet tout en état au moindre doute. Le backup complet couvre un
+# autre risque, plus lointain — « HA est cassé et je veux revenir à hier ». Un point de
+# restauration par jour suffit à ça ; 41 n'apportent rien de plus.
+#
+# maybe_backup — déclenche un backup complet si le créneau est ouvert, le saute sinon.
+# L'époch est écrit AVANT l'appel, comme pour le redémarrage : `backup_full` peut très
+# bien réussir côté Superviseur tout en rendant une erreur à curl (c'est arrivé 5 fois le
+# 2026-08-16, « backup non confirmé »). Marquer après ferait rejouer le backup à chaque
+# passe — exactement la panne qu'on corrige.
+maybe_backup() {
+  local now last age
+  now="$(date -u +%s 2>/dev/null || echo 0)"
+  last="$(cat "$BACKUP_LAST_FILE" 2>/dev/null || echo 0)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  age=$(( now - last ))
+  if [ "$last" -gt 0 ] && [ "$age" -lt "$BACKUP_MIN_INTERVAL" ]; then
+    bashio::log.info "backup complet sauté — dernier il y a $(( age / 60 )) min, minimum $(( BACKUP_MIN_INTERVAL / 60 )) min. La passe reste réversible (copie par fichier + check_config + rollback)."
+    return 0
+  fi
+  bashio::log.info "backup HA avant écriture…"
+  printf '%s\n' "$now" > "$BACKUP_LAST_FILE" 2>/dev/null || true
+  ha POST /services/hassio/backup_full "{\"name\":\"avant-git-deployer\"}" >/dev/null 2>&1 \
+    || bashio::log.warning "backup non confirmé (on continue)"
+}
+
+# --- Rechargement CIBLÉ plutôt que `reload_all` -------------------------------------
+#
+# POURQUOI. `homeassistant.reload_all` recharge d'un bloc TOUTES les intégrations
+# rechargeables — y compris celles que la passe n'a pas touchées. Sur une installation
+# fournie, ça n'est pas un détail : mesuré le 2026-08-16 sur ha-vallesvilles-family, le
+# seul appel `reload_all` a bloqué **77 secondes** (passe de 20:46:26, retour à 20:47:43).
+# Pendant ce blocage, la boucle d'événements de Core ne tourne plus : le client MQTT perd
+# sa connexion (« Error returned from MQTT server: The connection was lost. » à 20:47:27),
+# et TOUTES les entités MQTT — donc tout Zigbee2MQTT — passent `unavailable` d'un bloc.
+# Même seconde, même salve : délais dépassés sur le LAN, sur internet ET sur le Superviseur
+# (qui tourne pourtant sur la même machine) — la signature d'un gel, pas d'une panne réseau.
+#
+# Le décrochage MQTT arrive ~45-90 s APRÈS le début du gel, pas pendant : c'est le
+# keepalive du client qui met une période à constater la perte. C'est ce décalage qui
+# avait fait accuser le réseau du garage pendant deux jours.
+#
+# Ce que ça coûtait : 20 décrochages Zigbee le 2026-08-16, dont 19 sans la moindre cause
+# réseau. Volets et portail muets à chaque trou. Et un `reload_all` réveille au passage
+# l'intégration `rest`, qui recrache 44 lignes d'erreur à chaque rechargement (core#93527)
+# et relance TOUTES ses requêtes d'un coup — le gros du blocage vient de là.
+#
+# LA PARADE. Ne recharger que ce que la passe a réellement touché. Un déploiement
+# d'`automations.yaml` (le cas le plus fréquent : 7 passes sur 41 ce jour-là) n'a besoin
+# que d'`automation.reload` — un appel qui rend la main en une fraction de seconde et ne
+# touche ni `rest`, ni `command_line`, ni go2rtc.
+#
+# LE REPLI EST LARGE, PAS ÉTROIT. Tout fichier dont on ne sait pas dire quel service
+# l'applique rend « ALL » : on retombe alors exactement sur le comportement d'avant. Un
+# rechargement inutile coûte du gel ; un rechargement MANQUÉ produit un déploiement sans
+# effet, silencieux — c'est le pire mode de panne d'un déployeur (cf. le bloc `rest` plus
+# haut). Entre les deux, on paie le gel. Donc : on n'élargit la table de correspondance
+# qu'avec une certitude, jamais avec une intuition.
+#
+# reload_service_for REL — le service qui applique le fichier REL, ou l'un des deux
+# sentinelles : « ALL » (inconnu → recharger large) et « NONE » (rien à recharger).
+reload_service_for() {
+  local rel="$1" base="${1##*/}"
+  case "$rel" in
+    # Structurant : ces fichiers portent la forme même de la configuration (includes,
+    # unités, customize, packages entiers). Aucun rechargement ciblé ne les couvre.
+    configuration.yaml|secrets.yaml|customize.yaml|customize_glob.yaml|packages/*) printf 'ALL'; return 0 ;;
+    # Thèmes : service dédié, sans rapport avec le reste de la configuration.
+    themes/*) printf 'frontend/reload_themes'; return 0 ;;
+    # Lovelace en mode YAML relit le fichier du tableau de bord à la demande, et `www/`
+    # est servi tel quel : rien à recharger côté Core. C'est le cas qui payait le plus
+    # cher un `reload_all` — 5 passes ce jour-là pour un seul dashboards/ombrage.yaml.
+    dashboards/*|www/*) printf 'NONE'; return 0 ;;
+  esac
+  case "$base" in
+    *.md|*.txt|*.png|*.jpg|*.jpeg|*.svg|*.gif|*.ico) printf 'NONE'; return 0 ;;
+  esac
+  # Convention du découpage par `!include` : le nom du fichier EST le domaine. Elle ne
+  # vaut que pour les domaines dont le rechargement est un service documenté et sûr —
+  # `rest.yaml`, `sensor.yaml` et `binary_sensor.yaml` en sont volontairement absents
+  # (rechargement cassé pour rest, plateforme indéterminable pour les deux autres) et
+  # tombent donc dans le repli « ALL ».
+  case "$base" in
+    automations.yaml|automation.yaml) printf 'automation/reload' ;;
+    scripts.yaml|script.yaml)         printf 'script/reload' ;;
+    scenes.yaml|scene.yaml)           printf 'scene/reload' ;;
+    template.yaml)                    printf 'template/reload' ;;
+    group.yaml)                       printf 'group/reload' ;;
+    person.yaml)                      printf 'person/reload' ;;
+    zone.yaml)                        printf 'zone/reload' ;;
+    timer.yaml)                       printf 'timer/reload' ;;
+    schedule.yaml)                    printf 'schedule/reload' ;;
+    counter.yaml)                     printf 'counter/reload' ;;
+    command_line.yaml)                printf 'command_line/reload' ;;
+    rest_command.yaml)                printf 'rest_command/reload' ;;
+    shell_command.yaml)               printf 'shell_command/reload' ;;
+    input_boolean.yaml)               printf 'input_boolean/reload' ;;
+    input_button.yaml)                printf 'input_button/reload' ;;
+    input_datetime.yaml)              printf 'input_datetime/reload' ;;
+    input_number.yaml)                printf 'input_number/reload' ;;
+    input_select.yaml)                printf 'input_select/reload' ;;
+    input_text.yaml)                  printf 'input_text/reload' ;;
+    *)                                printf 'ALL' ;;
+  esac
+}
+
+# plan_reloads — parcourt $TMP/apply et rend la liste dédoublonnée des services à
+# appeler, « ALL » dès qu'un seul fichier l'exige, ou la chaîne vide si aucun fichier
+# n'appelle de rechargement. Un fichier SUPPRIMÉ demande le même rechargement qu'un
+# fichier écrit — c'est bien le domaine qui doit relire sa configuration.
+plan_reloads() {
+  local op rel svc seen=' ' out=''
+  while IFS=$'\t' read -r op rel; do
+    [ -n "$rel" ] || continue
+    svc="$(reload_service_for "$rel")"
+    if [ "$svc" = ALL ]; then printf 'ALL'; return 0; fi
+    if [ "$svc" = NONE ]; then continue; fi
+    case "$seen" in *" $svc "*) continue ;; esac
+    seen="${seen}${svc} "
+    out="${out} ${svc}"
+  done < "$TMP/apply"
+  printf '%s' "$out"
+}
+
 # APPLY_IN_PROGRESS — vaut 1 uniquement pendant la fenêtre où /config est mi-ancien
 # mi-nouveau : de la première écriture jusqu'à la décision garder/annuler. Un arrêt de
 # l'add-on (Superviseur, redémarrage HA, mise à jour, OOM) pendant cette fenêtre laissait
@@ -737,11 +885,7 @@ deploy_once() {
   bashio::log.info "à appliquer (${nb_apply}) :"; sed 's/^/  /' "$TMP/apply"
   if [ "$DRY_RUN" = "true" ]; then bashio::log.info "dry_run — rien écrit."; return 0; fi
 
-  if [ "$BACKUP_BEFORE" = "true" ]; then
-    bashio::log.info "backup HA avant écriture…"
-    ha POST /services/hassio/backup_full "{\"name\":\"avant-git-deployer\"}" >/dev/null 2>&1 \
-      || bashio::log.warning "backup non confirmé (on continue)"
-  fi
+  if [ "$BACKUP_BEFORE" = "true" ]; then maybe_backup; fi
 
   mkdir -p "$BK"; : > "$TMP/applied"
   # À partir d'ici et jusqu'à la décision garder/annuler, /config est mi-ancien mi-nouveau :
@@ -815,15 +959,13 @@ deploy_once() {
 
   # Ce qu'on va recharger, décidé AVANT de le faire — le compte-rendu doit être écrit
   # d'abord (voir juste en dessous).
-  local structural=0 reload_plan=""
-  if grep -qE $'\t(configuration\\.yaml|packages/)' "$TMP/apply"; then
-    structural=1; reload_plan="reload_core reload_all"
-  else
-    if grep -q $'\tautomations\\.yaml' "$TMP/apply"; then reload_plan="${reload_plan} automation"; fi
-    if grep -q $'\tscripts\\.yaml'     "$TMP/apply"; then reload_plan="${reload_plan} script"; fi
-    if grep -q $'\tscenes\\.yaml'      "$TMP/apply"; then reload_plan="${reload_plan} scene"; fi
-    reload_plan="${reload_plan} reload_all"
-  fi
+  local reload_plan reload_label
+  reload_plan="$(plan_reloads)"
+  case "$reload_plan" in
+    ALL) reload_label=" reload_core_config + reload_all (large)" ;;
+    '')  reload_label=" aucun rechargement nécessaire" ;;
+    *)   reload_label="${reload_plan}" ;;   # plan_reloads rend déjà une espace de tête
+  esac
 
   # `rest` ne se recharge pas : on NOTE le besoin de redémarrage ici, maybe_restart l'honore
   # après la passe. Les reloads ci-dessous restent faits dans tous les cas — ils portent les
@@ -834,7 +976,7 @@ deploy_once() {
     request_restart "déploiement ${new:0:8} touchant l'intégration rest"
   fi
 
-  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reload_plan}.${rest_note}"
+  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reload_label}.${rest_note}"
   if [ "$nb_repr" -gt 0 ]; then msg="${msg} Dont ${nb_repr} repris après passe interrompue."; fi
   bashio::log.info "OK — $msg"
 
@@ -851,15 +993,23 @@ deploy_once() {
   publish_deployed_sha "$new"
   write_status OK "$new" "$msg"
 
-  if [ "$structural" = 1 ]; then
-    bashio::log.info "structurant → reload_core + reload_all"
-    ha POST /services/homeassistant/reload_core_config '{}' >/dev/null 2>&1 || true
-  else
-    case "$reload_plan" in *automation*) ha POST /services/automation/reload '{}' >/dev/null 2>&1 || true ;; esac
-    case "$reload_plan" in *script*)     ha POST /services/script/reload '{}'     >/dev/null 2>&1 || true ;; esac
-    case "$reload_plan" in *scene*)      ha POST /services/scene/reload '{}'      >/dev/null 2>&1 || true ;; esac
-  fi
-  ha POST /services/homeassistant/reload_all '{}' >/dev/null 2>&1 || true
+  local svc
+  case "$reload_plan" in
+    ALL)
+      bashio::log.info "rechargement LARGE (reload_core_config + reload_all) — au moins un fichier sans rechargement ciblé connu"
+      ha POST /services/homeassistant/reload_core_config '{}' >/dev/null 2>&1 || true
+      ha POST /services/homeassistant/reload_all '{}' >/dev/null 2>&1 || true
+      ;;
+    '')
+      bashio::log.info "aucun rechargement — les fichiers déployés n'entrent pas dans la configuration chargée par Core"
+      ;;
+    *)
+      bashio::log.info "rechargement ciblé :${reload_plan}"
+      for svc in $reload_plan; do
+        ha POST "/services/${svc}" '{}' >/dev/null 2>&1 || true
+      done
+      ;;
+  esac
 
   notify "🟢 git-deployer — déployé" "$msg"
   return 0

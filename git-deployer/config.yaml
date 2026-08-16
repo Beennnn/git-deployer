@@ -1,5 +1,5 @@
 name: Git Deployer (git → HA)
-version: "0.1.0-alpha.16"
+version: "0.1.0-alpha.17"
 slug: git-deployer
 image: "ghcr.io/beennnn/git-deployer-{arch}"
 description: >-
@@ -34,6 +34,12 @@ options:
     dry_run: false
     allow_partial: false
     backup_before: true
+    # Un backup complet, c'est ~1,6 Go et près de 4 min d'écriture disque qui font ramer
+    # Core — mesuré 41 fois en une journée le 2026-08-16, soit 144 min cumulées. La
+    # réversibilité d'une passe ne dépend pas de lui (copie par fichier + check_config +
+    # rollback) : il couvre le retour en arrière lointain, et un point par jour y suffit.
+    # 0 = pas d'étranglement (un backup à chaque passe, l'ancien comportement).
+    backup_min_interval: 86400
     interval: 0
     # L'intégration `rest` ne se recharge pas (core#93527) : sans redémarrage, un
     # déploiement de rest.yaml est un no-op silencieux. Borné par restart_min_interval
@@ -52,6 +58,7 @@ schema:
     dry_run: bool
     allow_partial: bool
     backup_before: bool
+    backup_min_interval: int
     interval: int
     restart_on_rest: bool
     restart_min_interval: int

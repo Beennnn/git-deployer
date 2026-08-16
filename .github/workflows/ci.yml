@@ -36,3 +36,5 @@ jobs:
         run: bash tests/test_run_now_trigger.sh
       - name: indirection « !secret » vers secrets.yaml
         run: bash tests/test_secret_indirection.sh
+      - name: rechargement ciblé + étranglement du backup complet
+        run: bash tests/test_targeted_reload.sh
