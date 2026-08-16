@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Garde-fou : le mot de passe du dépôt peut vivre dans /config/secrets.yaml au lieu
-# des options de l'add-on, via une indirection « !secret <clé> ».
+# des options de l'add-on, via une indirection « secret://<clé> ».
 #
 # Pourquoi ce test existe. Les options du Superviseur sont stockées en clair et
 # ressortent en clair à toute interrogation de l'API — le type `password:` du schéma
@@ -18,7 +18,12 @@
 #      pas même un message d'erreur. Sinon on a déplacé la fuite, pas supprimée.
 #   3. L'ERREUR NOMME LA CLÉ MANQUANTE — sans ça, une faute de frappe dans le nom et
 #      un jeton révoqué produisent le même « 401 » indéchiffrable.
-#   4. LE PARSING TIENT — guillemets, commentaire de fin de ligne, clé indentée : une
+#   4. LE PRÉFIXE EST « secret:// », PAS « !secret » — le Superviseur gère « !secret »
+#      nativement mais le RÉSOUT avant de répondre à l'API : mesuré le 2026-08-16, une
+#      option en « !secret » ressort en clair dans `ha apps info --raw-json`, donc elle
+#      ne ferme PAS la fuite. « secret:// » ne veut rien dire pour le Superviseur, qui
+#      le transmet tel quel — c'est ce qui fait que l'API ne voit plus que le nom.
+#   5. LE PARSING TIENT — guillemets, commentaire de fin de ligne, clé indentée : une
 #      valeur mal découpée donne un jeton silencieusement faux, donc une panne
 #      d'authentification qu'on ira chercher du mauvais côté.
 #
@@ -35,7 +40,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok()    { printf '  ✅ %s\n' "$1"; }
 ko()    { printf '  ❌ %s\n' "$1"; fail=1; }
-check() { if [ "$2" = "$3" ]; then ok "$1"; else ko "$1 (attendu «$3», obtenu «$2»)"; fi; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else ko "$1 (attendu «${3}», obtenu «${2}»)"; fi; }
 
 # --- la vraie fonction, extraite de run.sh -----------------------------------
 sed -n '/^resolve_secret() {/,/^}/p' "$RUN_SH" > "$T/fn.sh"
@@ -72,24 +77,28 @@ check "valeur vide rendue inchangée" \
   "$(resolve_secret '' 'repository.password')" ''
 check "« !secretquelquechose » n'est PAS une indirection (préfixe = « !secret » + espace)" \
   "$(resolve_secret '!secretfoo' 'repository.password')" '!secretfoo'
+check "« secret:/quelquechose » n'est PAS une indirection (préfixe = « secret:// »)" \
+  "$(resolve_secret 'secret:/foo' 'repository.password')" 'secret:/foo'
 
 # 2. Résolution nominale + variantes de parsing.
-check "clé simple"                 "$(resolve_secret '!secret github_pat_deployer' 'p')" 'github_pat_11ABCDEF_nue'
-check "guillemets doubles retirés" "$(resolve_secret '!secret quoted_double' 'p')"       'github_pat_11ABCDEF_double'
-check "guillemets simples retirés" "$(resolve_secret '!secret quoted_simple' 'p')"       'github_pat_11ABCDEF_simple'
+check "clé simple (secret://)"     "$(resolve_secret 'secret://github_pat_deployer' 'p')" 'github_pat_11ABCDEF_nue'
+check "« !secret » reste accepté par filet" \
+  "$(resolve_secret '!secret github_pat_deployer' 'p')" 'github_pat_11ABCDEF_nue'
+check "guillemets doubles retirés" "$(resolve_secret 'secret://quoted_double' 'p')"       'github_pat_11ABCDEF_double'
+check "guillemets simples retirés" "$(resolve_secret 'secret://quoted_simple' 'p')"       'github_pat_11ABCDEF_simple'
 check "commentaire de fin de ligne retiré" \
-  "$(resolve_secret '!secret avec_commentaire' 'p')" 'github_pat_11ABCDEF_cmt'
+  "$(resolve_secret 'secret://avec_commentaire' 'p')" 'github_pat_11ABCDEF_cmt'
 check "« # » collé au texte gardé (YAML exige une espace avant un commentaire)" \
-  "$(resolve_secret '!secret diese_colle' 'p')" 'jeton#interne'
+  "$(resolve_secret 'secret://diese_colle' 'p')" 'jeton#interne'
 check "valeur contenant « : » gardée entière" \
-  "$(resolve_secret '!secret avec_deux_points' 'p')" 'https://exemple.test/chemin'
+  "$(resolve_secret 'secret://avec_deux_points' 'p')" 'https://exemple.test/chemin'
 check "espaces autour de la valeur retirés" \
-  "$(resolve_secret '!secret espaces_autour' 'p')" 'github_pat_11ABCDEF_pad'
+  "$(resolve_secret 'secret://espaces_autour' 'p')" 'github_pat_11ABCDEF_pad'
 check "espaces autour du NOM de clé tolérés" \
-  "$(resolve_secret '!secret   github_pat_deployer  ' 'p')" 'github_pat_11ABCDEF_nue'
+  "$(resolve_secret 'secret://  github_pat_deployer  ' 'p')" 'github_pat_11ABCDEF_nue'
 
 # 3. Le secret ne part JAMAIS ailleurs que sur stdout (le canal de retour).
-out="$(resolve_secret '!secret github_pat_deployer' 'repository.password' 2>"$T/err")"
+out="$(resolve_secret 'secret://github_pat_deployer' 'repository.password' 2>"$T/err")"
 check "résolution silencieuse : rien sur stderr" "$(wc -c <"$T/err" | tr -d ' ')" '0'
 check "la valeur est bien rendue"                "$out" 'github_pat_11ABCDEF_nue'
 
@@ -99,7 +108,7 @@ expect_fail() { # expect_fail LIBELLÉ VALEUR ATTENDU_DANS_LE_MESSAGE
   ( resolve_secret "$value" 'repository.password' ) >"$T/out" 2>"$T/err" || rc=$?
   if [ "$rc" -eq 0 ]; then ko "$label (aurait dû échouer)"; return; fi
   if ! grep -qF -- "$needle" "$T/err"; then
-    ko "$label (le message ne cite pas «$needle» : $(tr -d '\n' <"$T/err"))"; return
+    ko "$label (le message ne cite pas «${needle}» : $(tr -d '\n' <"$T/err"))"; return
   fi
   if grep -qF -- 'github_pat_11ABCDEF' "$T/err" "$T/out"; then
     ko "$label (le secret a fuité dans la sortie)"; return
@@ -107,14 +116,14 @@ expect_fail() { # expect_fail LIBELLÉ VALEUR ATTENDU_DANS_LE_MESSAGE
   ok "$label"
 }
 
-expect_fail "clé absente → message nommant la clé" '!secret pas_dans_le_fichier' 'pas_dans_le_fichier'
-expect_fail "clé présente mais vide → échec explicite" '!secret vide' 'vide'
-expect_fail "« !secret » sans nom de clé → échec explicite" '!secret ' '!secret'
-expect_fail "clé imbriquée ignorée (mapping plat attendu)" '!secret interne' 'interne'
+expect_fail "clé absente → message nommant la clé" 'secret://pas_dans_le_fichier' 'pas_dans_le_fichier'
+expect_fail "clé présente mais vide → échec explicite" 'secret://vide' 'vide'
+expect_fail "indirection sans nom de clé → échec explicite" 'secret://' 'secret://<clé>'
+expect_fail "clé imbriquée ignorée (mapping plat attendu)" 'secret://interne' 'interne'
 
 SECRETS_FILE="$T/inexistant.yaml"
 expect_fail "secrets.yaml absent → message nommant le fichier ET la clé" \
-  '!secret github_pat_deployer' 'github_pat_deployer'
+  'secret://github_pat_deployer' 'github_pat_deployer'
 SECRETS_FILE="$T/secrets.yaml"
 
 # 5. Le vrai run.sh appelle bien la fonction sur repository.password — sinon tout ce

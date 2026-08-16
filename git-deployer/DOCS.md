@@ -55,7 +55,7 @@ own the restart yourself).
 |---|---|---|
 | `repository.url` | — | HTTPS clone URL of your config repo |
 | `repository.username` | — | GitHub username |
-| `repository.password` | — | PAT with **read** access to the repo — see [Keeping the token out of the options](#keeping-the-token-out-of-the-options) |
+| `repository.password` | — | PAT with **read** access to the repo, or `secret://<key>` — see [Keeping the token out of the options](#keeping-the-token-out-of-the-options) |
 | `repository.branch` | `main` | Branch to deploy |
 | `deploy.subdir` | `config` | Repo subfolder that maps to `/config` |
 | `deploy.dry_run` | `false` | Show the plan, write nothing |
@@ -90,18 +90,32 @@ github_pat_deployer: github_pat_11ABCDEF…
 ```yaml
 # add-on options — this is all the API can ever hand back now
 repository:
-  password: "!secret github_pat_deployer"
+  password: "secret://github_pat_deployer"
 ```
 
-Anything starting with `!secret ` is read from `/config/secrets.yaml` at startup;
+Anything starting with `secret://` is read from `/config/secrets.yaml` at startup;
 anything else is used as-is, so **existing setups keep working untouched** and you can
 switch one option at a time. The resolved value is never logged, not even on failure —
 errors name the *key*, which is what tells a typo apart from a revoked token.
 
-Two things worth knowing:
+#### Why `secret://` and not Home Assistant's own `!secret`
+
+Supervisor understands `!secret <key>` in add-on options — but it **resolves the value
+before answering the API**. Measured on Supervisor 2026.08 (2026-08-16): the stored
+option does keep the literal (the error raised on an unknown key proves it), yet
+`GET /addons/<slug>/info` returns the *resolved* credential, in clear text. Confirmed by
+cross-check: pointing this add-on at the other add-on's key made the API hand back the
+other add-on's token. So `!secret` alone does **not** close this leak — the diagnostic
+prints the credential exactly as before.
+
+`secret://` means nothing to Supervisor, which passes the string through untouched. The
+add-on resolves it itself, and the API can only ever return the key name. `!secret` is
+still accepted here as a safety net, but in practice the add-on never sees that form.
+
+Two more things worth knowing:
 
 - **Upgrade first, switch the option second.** This add-on is the one that deploys, so
-  an option pointing at `!secret` on a version that cannot read it would break the very
+  an option pointing at a key on a version that cannot read it would break the very
   loop you would need to fix it.
 - `secrets.yaml` is only readable because the add-on already mounts `/config`. Nothing
   new is exposed, and Supervisor never serves that file over its API.

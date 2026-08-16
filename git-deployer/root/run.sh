@@ -20,7 +20,8 @@ set -euo pipefail
 # Fichier de secrets de Home Assistant. Surchargeable par env pour les tests.
 SECRETS_FILE="${SECRETS_FILE:-/config/secrets.yaml}"
 
-# resolve_secret VALEUR CHAMP — indirection « !secret <clé> » vers secrets.yaml.
+# resolve_secret VALEUR CHAMP — indirection vers une clé de secrets.yaml, sous deux
+# formes : « secret://<clé> » (celle qu'il faut utiliser) et « !secret <clé> ».
 #
 # POURQUOI. Les options d'add-on du Superviseur sont stockées EN CLAIR et ressortent
 # en clair à TOUTE interrogation de l'API (`ha apps info <slug> --raw-json` et
@@ -31,8 +32,21 @@ SECRETS_FILE="${SECRETS_FILE:-/config/secrets.yaml}"
 #
 # La parade : ne plus mettre le secret dans l'option, mais le NOM d'une clé de
 # /config/secrets.yaml, que l'API du Superviseur n'expose pas et que git ignore.
-# L'option ne contient plus que « !secret github_pat_deployer » — un diagnostic
+# L'option ne contient plus que « secret://github_pat_deployer » — un diagnostic
 # n'expose alors que ce nom, qui ne vaut rien seul.
+#
+# POURQUOI « secret:// » ET PAS « !secret ». Le Superviseur gère nativement le
+# préfixe « !secret », mais il le RÉSOUT AVANT de répondre : mesuré le 2026-08-16 sur
+# Supervisor 2026.08 — l'option stockée garde bien le littéral (le message d'erreur
+# sur une clé inconnue le montre), mais `GET /addons/<slug>/info` renvoie la valeur
+# RÉSOLUE, en clair. Une option en « !secret » ne ferme donc PAS la fuite qu'on vise :
+# le diagnostic sort le jeton exactement comme avant. Vérifié par recoupement — en
+# pointant cet add-on vers la clé de l'autre, l'API a renvoyé le jeton de l'autre.
+# « secret:// » n'a aucune signification pour le Superviseur : il le transmet tel quel,
+# l'add-on le résout lui-même, et l'API ne peut plus renvoyer que le nom de la clé.
+#
+# « !secret » reste accepté ici, mais uniquement par filet : le Superviseur l'ayant
+# déjà résolu, l'add-on ne le voit jamais en pratique.
 #
 # Rétro-compatible par construction : une valeur SANS le préfixe est rendue telle
 # quelle, donc la bascule se fait option par option, sans fenêtre de casse. C'est ce
@@ -52,16 +66,17 @@ SECRETS_FILE="${SECRETS_FILE:-/config/secrets.yaml}"
 resolve_secret() {
   local raw="${1-}" field="${2-option}" key='' line k v='' q rest found=0
   case "$raw" in
-    '!secret '*) key="${raw#'!secret '}" ;;
+    'secret://'*) key="${raw#secret://}" ;;
+    '!secret '*)  key="${raw#'!secret '}" ;;
     *) printf '%s' "$raw"; return 0 ;;
   esac
 
   key="${key#"${key%%[![:space:]]*}"}"   # trim gauche
   key="${key%"${key##*[![:space:]]}"}"   # trim droite
   [ -n "$key" ] || bashio::exit.nok \
-    "${field} : « !secret » sans nom de clé — écrire « !secret <clé> », <clé> étant une entrée de ${SECRETS_FILE}."
+    "${field} : indirection sans nom de clé — écrire « secret://<clé> », <clé> étant une entrée de ${SECRETS_FILE}."
   [ -r "$SECRETS_FILE" ] || bashio::exit.nok \
-    "${field} : indirection « !secret ${key} » demandée, mais ${SECRETS_FILE} est absent ou illisible."
+    "${field} : indirection « secret://${key} » demandée, mais ${SECRETS_FILE} est absent ou illisible."
 
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
@@ -92,7 +107,7 @@ resolve_secret() {
   done < "$SECRETS_FILE"
 
   [ "$found" = 1 ] || bashio::exit.nok \
-    "${field} : clé « ${key} » absente de ${SECRETS_FILE} (nom exact attendu, sans le préfixe « !secret »)."
+    "${field} : clé « ${key} » absente de ${SECRETS_FILE} (nom exact attendu, sans le préfixe « secret:// »)."
   [ -n "$v" ] || bashio::exit.nok \
     "${field} : la clé « ${key} » existe dans ${SECRETS_FILE} mais sa valeur est vide."
   printf '%s' "$v"

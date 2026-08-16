@@ -83,7 +83,7 @@ the deploy is non-destructive, validated, and reversible.
 repository:
   url: "https://github.com/you/your-ha-config.git"
   username: "your-github-user"
-  password: "!secret github_pat_deployer"   # key of /config/secrets.yaml — see below.
+  password: "secret://github_pat_deployer"  # key of /config/secrets.yaml — see below.
                                # A raw PAT still works, but Supervisor hands options
                                # back in clear text to any API call, so it leaks on
                                # the first routine diagnostic.
@@ -116,11 +116,18 @@ Put the token in `/config/secrets.yaml` and reference it by name:
 github_pat_deployer: github_pat_11ABCDEF…
 ```
 
-Any option value starting with `!secret ` is resolved from that file at startup; every
+Any option value starting with `secret://` is resolved from that file at startup; every
 other value is used as-is, so existing setups keep working and you can switch one
-option at a time. **Upgrade the add-on before switching the option** — this is the
-add-on that deploys, so a `!secret` value on a version that cannot read it would break
-the loop you would need to fix it. Full details in [DOCS.md](git-deployer/DOCS.md).
+option at a time.
+
+Mind the prefix: Home Assistant's own `!secret` is resolved by Supervisor *before* it
+answers the API, so an option using it leaves the credential just as visible to a
+diagnostic. `secret://` means nothing to Supervisor, which passes it through untouched
+— that is what actually closes the leak.
+
+**Upgrade the add-on before switching the option** — this is the add-on that deploys,
+so a key reference on a version that cannot read it would break the loop you would need
+to fix it. Full details in [DOCS.md](git-deployer/DOCS.md).
 
 ## Installation
 
