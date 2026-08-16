@@ -17,9 +17,91 @@
 # (homeassistant_api: true) → AUCUN token HA à créer à la main.
 set -euo pipefail
 
+# Fichier de secrets de Home Assistant. Surchargeable par env pour les tests.
+SECRETS_FILE="${SECRETS_FILE:-/config/secrets.yaml}"
+
+# resolve_secret VALEUR CHAMP — indirection « !secret <clé> » vers secrets.yaml.
+#
+# POURQUOI. Les options d'add-on du Superviseur sont stockées EN CLAIR et ressortent
+# en clair à TOUTE interrogation de l'API (`ha apps info <slug> --raw-json` et
+# l'endpoint REST équivalent). Le type `password:` du schéma ne masque que le champ
+# dans l'interface — il ne protège rien côté API. Un diagnostic de routine suffit
+# donc à recopier le jeton dans un journal ou un transcript : c'est arrivé le
+# 2026-08-16, et le PAT a dû être révoqué. Le défaut est structurel, pas accidentel.
+#
+# La parade : ne plus mettre le secret dans l'option, mais le NOM d'une clé de
+# /config/secrets.yaml, que l'API du Superviseur n'expose pas et que git ignore.
+# L'option ne contient plus que « !secret github_pat_deployer » — un diagnostic
+# n'expose alors que ce nom, qui ne vaut rien seul.
+#
+# Rétro-compatible par construction : une valeur SANS le préfixe est rendue telle
+# quelle, donc la bascule se fait option par option, sans fenêtre de casse. C'est ce
+# qui permet de déployer cette version d'abord et de changer l'option ensuite —
+# l'ordre inverse casserait la boucle de déploiement, et c'est justement l'add-on
+# qui déploie.
+#
+# La valeur résolue n'est JAMAIS journalisée, même en cas d'erreur : ce serait
+# recréer le problème un cran plus loin. Les messages d'échec ne citent que le NOM
+# de la clé et du champ — exactement ce qu'il faut pour distinguer une faute de
+# frappe d'une panne d'authentification, deux causes qui donnent sinon le même
+# « 401 » illisible.
+#
+# Le fichier est lu en shell pur (pas de python/yq dans cette image) : secrets.yaml
+# est un mapping plat clé → valeur, les cas gérés sont la valeur nue, la valeur
+# entre guillemets simples ou doubles, et le commentaire de fin de ligne.
+resolve_secret() {
+  local raw="${1-}" field="${2-option}" key='' line k v='' q rest found=0
+  case "$raw" in
+    '!secret '*) key="${raw#'!secret '}" ;;
+    *) printf '%s' "$raw"; return 0 ;;
+  esac
+
+  key="${key#"${key%%[![:space:]]*}"}"   # trim gauche
+  key="${key%"${key##*[![:space:]]}"}"   # trim droite
+  [ -n "$key" ] || bashio::exit.nok \
+    "${field} : « !secret » sans nom de clé — écrire « !secret <clé> », <clé> étant une entrée de ${SECRETS_FILE}."
+  [ -r "$SECRETS_FILE" ] || bashio::exit.nok \
+    "${field} : indirection « !secret ${key} » demandée, mais ${SECRETS_FILE} est absent ou illisible."
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    # Ligne vide, commentaire, ou clé indentée : secrets.yaml est un mapping PLAT,
+    # une clé indentée appartient à une structure imbriquée qu'on ne gère pas.
+    case "$line" in ''|'#'*|[[:space:]]*) continue ;; esac
+    k="${line%%:*}"
+    [ "$k" != "$line" ] || continue      # pas de « : » → pas une paire
+    case "$k" in '"'*'"'|"'"*"'") k="${k:1:${#k}-2}" ;; esac
+    [ "$k" = "$key" ] || continue
+
+    v="${line#*:}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    q="${v:0:1}"
+    if [ "$q" = '"' ] || [ "$q" = "'" ]; then
+      # Valeur entre guillemets : tout jusqu'au guillemet fermant, ce qui préserve
+      # un « # » interne au jeton et ignore un commentaire qui suivrait.
+      rest="${v:1}"
+      case "$rest" in *"$q"*) v="${rest%%"$q"*}" ;; *) v="$rest" ;; esac
+    else
+      # Valeur nue : YAML exige une espace avant le « # » d'un commentaire, donc un
+      # « # » collé au texte fait partie de la valeur.
+      case "$v" in *' #'*) v="${v%% #*}" ;; esac
+      v="${v%"${v##*[![:space:]]}"}"
+    fi
+    found=1
+    break
+  done < "$SECRETS_FILE"
+
+  [ "$found" = 1 ] || bashio::exit.nok \
+    "${field} : clé « ${key} » absente de ${SECRETS_FILE} (nom exact attendu, sans le préfixe « !secret »)."
+  [ -n "$v" ] || bashio::exit.nok \
+    "${field} : la clé « ${key} » existe dans ${SECRETS_FILE} mais sa valeur est vide."
+  printf '%s' "$v"
+}
+
 REPO_URL="$(bashio::config 'repository.url')"
 GIT_USER="$(bashio::config 'repository.username')"
-GIT_PASS="$(bashio::config 'repository.password')"
+# Le seul secret de cet add-on. Résolu ici, une fois, jamais journalisé ensuite.
+GIT_PASS="$(resolve_secret "$(bashio::config 'repository.password')" 'repository.password')"
 BRANCH="$(bashio::config 'repository.branch')"
 SUBDIR="$(bashio::config 'deploy.subdir')"
 DRY_RUN="$(bashio::config 'deploy.dry_run')"
