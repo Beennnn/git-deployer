@@ -50,6 +50,13 @@ DEPLOYED_SHA_ENTITY="${DEPLOYED_SHA_ENTITY:-input_text.ha_deployed_sha}"
 # positif à chaque période >45 min sans déploiement, cas nominal). L'époch change à chaque
 # passe → l'état bouge → le watchdog peut mesurer un vrai âge « dernière passe saine ».
 HEARTBEAT_ENTITY="${HEARTBEAT_ENTITY:-input_text.git_deployer_heartbeat}"
+# Entité DÉCLENCHEUR — booléen qu'on passe à `on` (bouton de dashboard, automation, appel de
+# service) pour demander une passe TOUT DE SUITE, sans toucher à l'add-on. Facultative : si
+# elle n'existe pas côté HA, la boucle se comporte exactement comme avant.
+RUN_NOW_ENTITY="${RUN_NOW_ENTITY:-input_boolean.git_deployer_run_now}"
+# Pas de scrutation du déclencheur pendant l'attente. 15 s = 4 lectures d'état par minute sur
+# l'API Core, coût négligeable, et un délai de prise en compte que personne ne trouve long.
+RUN_NOW_POLL="${RUN_NOW_POLL:-15}"
 
 TMP="${TMP:-/tmp/git-deployer}"
 BK="$TMP/rollback"
@@ -231,6 +238,61 @@ publish_heartbeat() {
   ha POST /services/input_text/set_value \
      "{\"entity_id\":\"${HEARTBEAT_ENTITY}\",\"value\":\"${now}\"}" >/dev/null 2>&1 \
      || bashio::log.warning "heartbeat non publié (${HEARTBEAT_ENTITY} absent ?)"
+}
+
+# run_now_requested — le drapeau « passe maintenant » est-il levé ? Renvoie 0 (oui) APRÈS
+# l'avoir remis à `off`, 1 sinon.
+#
+# L'extinction précède la passe au lieu de la suivre : c'est un accusé de réception, pas un
+# compte-rendu. Éteint après, un drapeau survivrait à une passe qui échoue ou à un arrêt de
+# l'add-on en pleine passe, et chaque tour suivant en relancerait une — une boucle serrée née
+# d'un seul clic. Éteint avant, le pire cas est une demande perdue : on reclique.
+#
+# Silencieux quand l'entité n'existe pas (curl -f échoue) : le déclencheur est facultatif, et
+# un `input_boolean` absent ne doit pas remplir le journal toutes les 15 s. probe_run_now le
+# dit une fois, au démarrage.
+run_now_requested() {
+  local raw
+  raw="$(ha GET "/states/${RUN_NOW_ENTITY}" 2>/dev/null)" || return 1
+  printf '%s' "$raw" | grep -q '"state"[[:space:]]*:[[:space:]]*"on"' || return 1
+  ha POST /services/input_boolean/turn_off "{\"entity_id\":\"${RUN_NOW_ENTITY}\"}" >/dev/null 2>&1 \
+    || bashio::log.warning "déclencheur : ${RUN_NOW_ENTITY} non remis à off — il sera relu « on » au tour suivant"
+  return 0
+}
+
+# probe_run_now — dit une fois, au démarrage, si le déclencheur est utilisable. Appelée APRÈS
+# la première passe : celle-ci a déjà attendu Core (wait_core_ready), donc un échec ici
+# signifie vraiment « entité absente » et non « Core pas encore prêt ».
+probe_run_now() {
+  if ha GET "/states/${RUN_NOW_ENTITY}" >/dev/null 2>&1; then
+    bashio::log.info "déclencheur « passe maintenant » : ${RUN_NOW_ENTITY} (scruté toutes les ${RUN_NOW_POLL}s)"
+  else
+    bashio::log.info "déclencheur « passe maintenant » inactif — ${RUN_NOW_ENTITY} n'existe pas côté HA (facultatif ; le créer permet de forcer une passe sans redémarrer l'add-on)"
+  fi
+}
+
+# wait_or_trigger SECONDS — attend SECONDS en fractionnant l'attente pour scruter le
+# déclencheur. Renvoie 0 si l'attente est allée à son terme, 1 si une passe a été demandée.
+#
+# Le `sleep "$INTERVAL"` monolithique d'avant faisait de `hassio.addon_restart` le SEUL moyen
+# d'écourter l'attente — geste contre-indiqué pour deux raisons vécues : le redémarrage retire
+# brièvement son marqueur (input_text.ha_deployed_sha) à la garde de git-exporter, ce qui
+# rouvre la course lost-update que cette garde ferme (2026-08-16) ; et un redémarrage qui
+# repart d'un clone frais peut sauter l'apply (2026-08-08). Fractionner supprime le besoin :
+# le process n'est jamais tué, donc ni le marqueur ni /data/repo ne bougent.
+#
+# Effet de bord bienvenu : un SIGTERM (arrêt, mise à jour de l'add-on) est traité en
+# ≤ RUN_NOW_POLL secondes au lieu d'attendre la fin d'un sleep de 900 s — bash n'exécute un
+# trap qu'entre deux commandes, jamais pendant.
+wait_or_trigger() {
+  local left="$1" step
+  while [ "$left" -gt 0 ]; do
+    step=$(( left < RUN_NOW_POLL ? left : RUN_NOW_POLL ))
+    sleep "$step"
+    left=$(( left - step ))
+    if run_now_requested; then return 1; fi
+  done
+  return 0
 }
 
 # yaml_dq VALUE — émet un scalaire YAML DOUBLE-QUOTÉ correctement échappé.
@@ -687,11 +749,17 @@ bashio::log.info "git-deployer — dépôt=${REPO_URL} branche=${BRANCH} sous-do
 # appelée à CHAQUE passe, y compris celles qui n'ont rien déployé — c'est ainsi qu'un
 # redémarrage différé par l'étranglement finit par avoir lieu.
 if [ "${INTERVAL:-0}" -gt 0 ]; then
-  bashio::log.info "mode boucle : une passe toutes les ${INTERVAL}s"
+  bashio::log.info "mode boucle : une passe toutes les ${INTERVAL}s (ou dès ${RUN_NOW_ENTITY} = on)"
+  probed=0
   while true; do
     deploy_once || bashio::log.warning "passe en échec — on continue"
     maybe_restart
-    sleep "${INTERVAL}"
+    if [ "$probed" = 0 ]; then probe_run_now; probed=1; fi
+    # L'attente commence APRÈS maybe_restart : si Core redémarre, les lectures du
+    # déclencheur échouent en silence pendant la coupure et reprennent toutes seules.
+    if ! wait_or_trigger "$INTERVAL"; then
+      bashio::log.info "déclencheur reçu (${RUN_NOW_ENTITY}) — passe anticipée"
+    fi
   done
 else
   rc=0
