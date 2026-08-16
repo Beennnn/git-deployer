@@ -42,7 +42,14 @@ DEPLOYED_SHA_ENTITY="${DEPLOYED_SHA_ENTITY:-input_text.ha_deployed_sha}"
 # passe → l'état bouge → le watchdog peut mesurer un vrai âge « dernière passe saine ».
 HEARTBEAT_ENTITY="${HEARTBEAT_ENTITY:-input_text.git_deployer_heartbeat}"
 
-TMP="/tmp/git-deployer"
+TMP="${TMP:-/tmp/git-deployer}"
+BK="$TMP/rollback"
+
+# Profondeur de recherche « ce contenu live vient-il d'un commit connu ? » (cf.
+# find_known_commit). 200 commits couvrent largement l'historique qu'un /config peut
+# retarder — au-delà, c'est que le déployeur est arrêté depuis des semaines et le
+# diagnostic « modifié en live » redevient l'hypothèse honnête.
+KNOWN_DEPTH=200
 
 jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g'; }
 
@@ -232,6 +239,69 @@ write_status() {
   } > "$dir/last-run.yaml" 2>/dev/null || true
 }
 
+# find_known_commit TIP PATH LIVE — le contenu live de PATH est-il, octet pour octet, la
+# version de PATH d'un commit atteignable depuis TIP ? Renvoie ce commit, ou rien.
+#
+# C'est le test qui sépare deux causes que la garde anti-écrasement confondait sous le
+# même verdict « modifié en live » :
+#   - une VRAIE édition humaine (File editor, UI) → contenu que git n'a jamais vu → refus,
+#     c'est tout l'intérêt de la garde : ne pas écraser un travail non sauvegardé ;
+#   - une PASSE INTERROMPUE du déployeur → contenu qui est exactement un état de git, juste
+#     pas celui attendu. Personne n'a rien tapé, il n'y a rien à protéger, et refuser
+#     d'appliquer fige la chaîne jusqu'à une intervention manuelle.
+#
+# Vécu le 2026-08-16 : `automations.yaml` et `template.yaml` se sont retrouvés chacun sur un
+# commit DIFFÉRENT (l'un avec la PR #274 et pas la #275, l'autre l'inverse), le déployeur a
+# crié « modifiés en live », et la chaîne est restée bloquée jusqu'à une restauration à la
+# main par scp. Aucun humain n'avait touché ces fichiers — l'auteur était le déployeur.
+#
+# Une seule invocation de git par fichier : `rev-list` donne les commits, `cat-file
+# --batch-check` résout les <commit>:<path> d'un coup, awk apparie les deux listes ligne à
+# ligne (l'ordre est conservé). Sur une ligne trouvée $1 est le SHA du blob, sur une ligne
+# absente c'est « <rev>:<path> » suivi de « missing » — la comparaison au hash ne peut donc
+# pas se tromper de colonne.
+find_known_commit() {
+  local tip="$1" path="$2" live="$3" h
+  h="$(git -C "$WORK_DIR" hash-object "$live" 2>/dev/null)" || return 1
+  [ -n "$h" ] || return 1
+  git -C "$WORK_DIR" rev-list -n "$KNOWN_DEPTH" "$tip" > "$TMP/revs" 2>/dev/null || return 1
+  sed "s|\$|:${path}|" "$TMP/revs" \
+    | git -C "$WORK_DIR" cat-file --batch-check 2>/dev/null \
+    | awk -v h="$h" 'NR==FNR { c[FNR]=$0; next } $1==h { print c[FNR]; exit }' "$TMP/revs" -
+}
+
+# restore_applied — remet /config exactement dans l'état d'avant la boucle d'écriture, à
+# partir de $TMP/applied (E = le fichier existait, sa copie est dans $BK ; N = il n'existait
+# pas, on le retire). Idempotent, sûr si la boucle n'a rien écrit.
+#
+# Extrait des trois copies qui traînaient (échec de check_config, Core injoignable, signal) :
+# une seule définition, donc un seul endroit où se tromper.
+restore_applied() {
+  local st rel live
+  [ -s "$TMP/applied" ] || return 0
+  while IFS=$'\t' read -r st rel; do
+    [ -n "$rel" ] || continue
+    live="${CONFIG_DIR}/${rel}"
+    if [ "$st" = "E" ]; then cp "$BK/$rel" "$live"; else rm -f "$live"; fi
+  done < "$TMP/applied"
+}
+
+# APPLY_IN_PROGRESS — vaut 1 uniquement pendant la fenêtre où /config est mi-ancien
+# mi-nouveau : de la première écriture jusqu'à la décision garder/annuler. Un arrêt de
+# l'add-on (Superviseur, redémarrage HA, mise à jour, OOM) pendant cette fenêtre laissait
+# /config dans un état qui n'est celui d'AUCUN commit — l'état exact constaté le 2026-08-16,
+# que la passe suivante interprétait ensuite comme une édition humaine.
+APPLY_IN_PROGRESS=0
+on_signal() {
+  if [ "$APPLY_IN_PROGRESS" = 1 ]; then
+    bashio::log.warning "arrêt demandé pendant l'écriture — remise en état de /config avant de sortir"
+    restore_applied
+    write_status ROLLBACK "" "passe interrompue par un arrêt de l'add-on — fichiers remis en état"
+  fi
+  exit 143
+}
+trap on_signal TERM INT
+
 deploy_once() {
   rm -rf "$TMP"; mkdir -p "$TMP"
 
@@ -293,8 +363,8 @@ deploy_once() {
   fi
   bashio::log.info "changements détectés :"; cat "$TMP/changes"
 
-  : > "$TMP/apply"; : > "$TMP/conflicts"
-  local status path rel live
+  : > "$TMP/apply"; : > "$TMP/conflicts"; : > "$TMP/reprises"
+  local status path rel live known
   while IFS=$'\t' read -r status path; do
     [ -n "$path" ] || continue
     rel="${path#"${SUBDIR}"/}"
@@ -313,6 +383,9 @@ deploy_once() {
         [ -e "$live" ] || continue
         git -C "$WORK_DIR" show "${old}:${path}" > "$TMP/old" 2>/dev/null || : > "$TMP/old"
         if cmp -s "$TMP/old" "$live"; then printf 'D\t%s\n' "$rel" >> "$TMP/apply"
+        elif known="$(find_known_commit "$new" "$path" "$live")" && [ -n "$known" ]; then
+          printf 'D\t%s\n' "$rel" >> "$TMP/apply"
+          printf '%s (contenu de %s — passe interrompue)\n' "$rel" "${known:0:8}" >> "$TMP/reprises"
         else printf '%s (suppression)\n' "$rel" >> "$TMP/conflicts"; fi
         ;;
       *)
@@ -321,6 +394,14 @@ deploy_once() {
         git -C "$WORK_DIR" show "${old}:${path}" > "$TMP/old" 2>/dev/null || : > "$TMP/old"
         if { [ ! -e "$live" ] && [ ! -s "$TMP/old" ]; } || { [ -e "$live" ] && cmp -s "$TMP/old" "$live"; }; then
           printf 'W\t%s\n' "$rel" >> "$TMP/apply"
+        elif [ -e "$live" ] && known="$(find_known_commit "$new" "$path" "$live")" && [ -n "$known" ]; then
+          # Le live ne correspond ni à `old` ni à `new`, mais c'est mot pour mot un état de
+          # git : passe interrompue, pas édition humaine. Rien à protéger — on applique et
+          # on le DIT, au lieu d'accuser un humain et de figer la chaîne (cf.
+          # find_known_commit). L'écrasement est sans perte : le contenu remplacé est
+          # récupérable par son commit, nommé ci-dessous.
+          printf 'W\t%s\n' "$rel" >> "$TMP/apply"
+          printf '%s (contenu de %s — passe interrompue)\n' "$rel" "${known:0:8}" >> "$TMP/reprises"
         else
           printf '%s (modifiée en live)\n' "$rel" >> "$TMP/conflicts"
         fi
@@ -328,9 +409,15 @@ deploy_once() {
     esac
   done < "$TMP/changes"
 
-  local nb_apply nb_confl
+  local nb_apply nb_confl nb_repr
   nb_apply="$(wc -l < "$TMP/apply" | tr -d ' ')"
   nb_confl="$(wc -l < "$TMP/conflicts" | tr -d ' ')"
+  nb_repr="$(wc -l < "$TMP/reprises" | tr -d ' ')"
+
+  if [ "$nb_repr" -gt 0 ]; then
+    bashio::log.warning "REPRISE (${nb_repr}) — contenu live issu d'un autre commit, pas d'une édition humaine : une passe précédente s'est interrompue. On réapplique."
+    cat "$TMP/reprises"
+  fi
 
   if [ "$nb_confl" -gt 0 ]; then
     bashio::log.warning "CONFLITS (${nb_confl}) — modifiés en live sans passer par git :"; cat "$TMP/conflicts"
@@ -357,15 +444,36 @@ deploy_once() {
       || bashio::log.warning "backup non confirmé (on continue)"
   fi
 
-  local BK="$TMP/rollback"; mkdir -p "$BK"; : > "$TMP/applied"
-  local op
+  mkdir -p "$BK"; : > "$TMP/applied"
+  # À partir d'ici et jusqu'à la décision garder/annuler, /config est mi-ancien mi-nouveau :
+  # toute sortie doit passer par restore_applied (échec d'écriture, signal, check_config).
+  APPLY_IN_PROGRESS=1
+  local op stage
   while IFS=$'\t' read -r op rel; do
     [ -n "$rel" ] || continue
     live="${CONFIG_DIR}/${rel}"
     if [ -e "$live" ]; then mkdir -p "$BK/$(dirname "$rel")"; cp "$live" "$BK/$rel"; printf 'E\t%s\n' "$rel" >> "$TMP/applied"
     else printf 'N\t%s\n' "$rel" >> "$TMP/applied"; fi
     if [ "$op" = "D" ]; then rm -f "$live"; bashio::log.info "supprimé  $rel"
-    else mkdir -p "${CONFIG_DIR}/$(dirname "$rel")"; git -C "$WORK_DIR" show "${new}:${SUBDIR}/${rel}" > "$live" || { fail "écriture $rel"; return 1; }; bashio::log.info "écrit     $rel"; fi
+    else
+      mkdir -p "${CONFIG_DIR}/$(dirname "$rel")"
+      # Écrire à côté puis renommer : un `> "$live"` direct tronque la cible AVANT que git
+      # ait produit un octet, donc un échec (ou un arrêt) laisse HA avec un fichier vide,
+      # état qui n'est celui d'aucun commit. Le fichier d'appoint est sur le MÊME système de
+      # fichiers que la cible — condition pour que `mv` soit un renommage atomique et non
+      # une copie ; c'est pourquoi il n'est pas dans $TMP (/tmp est un autre volume).
+      stage="${live}.git-deployer.tmp"
+      if ! git -C "$WORK_DIR" show "${new}:${SUBDIR}/${rel}" > "$stage" 2>/dev/null || ! mv -f "$stage" "$live"; then
+        rm -f "$stage"
+        bashio::log.error "écriture ${rel} en échec — annulation de la passe entière"
+        restore_applied
+        APPLY_IN_PROGRESS=0
+        write_status ROLLBACK "$new" "écriture de ${rel} impossible — passe annulée, fichiers remis en état"
+        fail "écriture ${rel} impossible — passe annulée, ${CONFIG_DIR} remis dans son état d'avant."
+        return 1
+      fi
+      bashio::log.info "écrit     $rel"
+    fi
   done < "$TMP/apply"
 
   # Deux échecs très différents se cachaient derrière un seul ROLLBACK :
@@ -388,11 +496,8 @@ deploy_once() {
 
   if [ -z "$check" ]; then
     bashio::log.warning "check_config injoignable après 3 tentatives → remise en état (rien de prouvé sur la validité)"
-    local st
-    while IFS=$'\t' read -r st rel; do
-      [ -n "$rel" ] || continue; live="${CONFIG_DIR}/${rel}"
-      if [ "$st" = "E" ]; then cp "$BK/$rel" "$live"; else rm -f "$live"; fi
-    done < "$TMP/applied"
+    restore_applied
+    APPLY_IN_PROGRESS=0
     write_status RETRY "$new" "Core injoignable — validation impossible, fichiers remis en état, retente à la passe suivante"
     return 0
   fi
@@ -400,33 +505,54 @@ deploy_once() {
   result="$(printf '%s' "$check" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')"
   if [ "$result" != "valid" ]; then
     bashio::log.error "check_config=${result:-inconnu} → ROLLBACK"
-    local st
-    while IFS=$'\t' read -r st rel; do
-      [ -n "$rel" ] || continue; live="${CONFIG_DIR}/${rel}"
-      if [ "$st" = "E" ]; then cp "$BK/$rel" "$live"; else rm -f "$live"; fi
-    done < "$TMP/applied"
+    restore_applied
+    APPLY_IN_PROGRESS=0
     write_status ROLLBACK "$new" "config invalide après déploiement — rollback effectué"
     fail "config invalide après déploiement — rollback effectué."
     return 1
   fi
+  # /config est cohérent avec `new` et validé : plus rien à annuler.
+  APPLY_IN_PROGRESS=0
 
-  local reloaded=""
+  # Ce qu'on va recharger, décidé AVANT de le faire — le compte-rendu doit être écrit
+  # d'abord (voir juste en dessous).
+  local structural=0 reload_plan=""
   if grep -qE $'\t(configuration\\.yaml|packages/)' "$TMP/apply"; then
-    bashio::log.info "structurant → reload_core + reload_all"
-    ha POST /services/homeassistant/reload_core_config '{}' >/dev/null 2>&1 || true
-    ha POST /services/homeassistant/reload_all '{}' >/dev/null 2>&1 && reloaded="reload_all"
+    structural=1; reload_plan="reload_core reload_all"
   else
-    grep -q $'\tautomations\\.yaml' "$TMP/apply" && ha POST /services/automation/reload '{}' >/dev/null 2>&1 && reloaded="$reloaded automation" || true
-    grep -q $'\tscripts\\.yaml' "$TMP/apply"     && ha POST /services/script/reload '{}' >/dev/null 2>&1 && reloaded="$reloaded script" || true
-    grep -q $'\tscenes\\.yaml' "$TMP/apply"      && ha POST /services/scene/reload '{}' >/dev/null 2>&1 && reloaded="$reloaded scene" || true
-    ha POST /services/homeassistant/reload_all '{}' >/dev/null 2>&1 && reloaded="$reloaded reload_all" || true
+    if grep -q $'\tautomations\\.yaml' "$TMP/apply"; then reload_plan="${reload_plan} automation"; fi
+    if grep -q $'\tscripts\\.yaml'     "$TMP/apply"; then reload_plan="${reload_plan} script"; fi
+    if grep -q $'\tscenes\\.yaml'      "$TMP/apply"; then reload_plan="${reload_plan} scene"; fi
+    reload_plan="${reload_plan} reload_all"
   fi
 
-  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reloaded:- (aucun)}."
+  local msg="Déployé ${nb_apply} fichier(s) depuis ${BRANCH} (${new:0:8}). Rechargé:${reload_plan}."
+  if [ "$nb_repr" -gt 0 ]; then msg="${msg} Dont ${nb_repr} repris après passe interrompue."; fi
   bashio::log.info "OK — $msg"
-  # /config cohérent avec new : marqueur (anti-course) + compte-rendu (lisible via git).
+
+  # ⚠️ Ordre volontaire : marqueur + compte-rendu AVANT les reloads.
+  #
+  # `reload_all` recharge l'intégration command_line, donc le capteur qui lit
+  # .deploy/last-run.yaml (sensor.deploiement_ha_dernier_resultat côté
+  # ha-vallesvilles-family). Écrire le compte-rendu APRÈS le reload lui faisait relire
+  # l'ANCIEN résultat, puis attendre son `scan_interval` (5 min) pour voir le bon. Mesuré le
+  # 2026-08-16 : passe OK à 14:08:10, capteur encore CONFLICT jusqu'à 14:12:57 — largement
+  # assez pour croire qu'une réparation qui venait de réussir avait échoué, et repartir en
+  # diagnostic. En écrivant d'abord, le reload publie lui-même le bon état, en quelques
+  # secondes au lieu de cinq minutes.
   publish_deployed_sha "$new"
   write_status OK "$new" "$msg"
+
+  if [ "$structural" = 1 ]; then
+    bashio::log.info "structurant → reload_core + reload_all"
+    ha POST /services/homeassistant/reload_core_config '{}' >/dev/null 2>&1 || true
+  else
+    case "$reload_plan" in *automation*) ha POST /services/automation/reload '{}' >/dev/null 2>&1 || true ;; esac
+    case "$reload_plan" in *script*)     ha POST /services/script/reload '{}'     >/dev/null 2>&1 || true ;; esac
+    case "$reload_plan" in *scene*)      ha POST /services/scene/reload '{}'      >/dev/null 2>&1 || true ;; esac
+  fi
+  ha POST /services/homeassistant/reload_all '{}' >/dev/null 2>&1 || true
+
   notify "🟢 git-deployer — déployé" "$msg"
   return 0
 }

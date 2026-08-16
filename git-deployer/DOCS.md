@@ -11,11 +11,22 @@ for the full rationale and comparison with other add-ons.
 3. **Anti-clobber guard**: apply a file only if the live `/config` version equals
    the *previous* git version. Otherwise it's a **conflict** → nothing is written
    (unless `allow_partial`) and you're notified.
+   **Exception — resumed files**: if the live content is byte-for-byte the version
+   from another commit reachable from the branch tip, it was written by an earlier
+   pass that stopped halfway, not by a person. Such a file is applied and reported
+   as `REPRISE` in the log; nothing is lost, since the replaced content is still
+   retrievable from the commit named in that log line.
 4. **Full HA backup** before writing.
-5. Write the safe files (deletions handled).
+5. Write the safe files (deletions handled). Each file is written beside its target
+   and renamed into place, and the whole set is **all-or-nothing**: a failed write —
+   or the add-on being stopped mid-pass — restores every file already touched.
 6. **`check_config`** → **rollback** if invalid.
-7. **Targeted reload** (`automation`/`script`/`scene`); restart suggested only for
-   structural files (`configuration.yaml`, `packages/`).
+7. Publish `deployed_sha` and the `.deploy/last-run.yaml` report, **then**
+   **targeted reload** (`automation`/`script`/`scene`); restart suggested only for
+   structural files (`configuration.yaml`, `packages/`). The report is written
+   *before* the reload on purpose: `reload_all` refreshes the `command_line` sensor
+   that reads it, so writing after would make that sensor publish the **previous**
+   result until its next poll (5 min by default).
 
 The first run clones and **stops** (no apply without a comparison base).
 
