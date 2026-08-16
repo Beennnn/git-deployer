@@ -28,6 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: base de comparaison = SHA appliqué, pas SHA fetché
+        run: bash tests/test_base_deployed_sha.sh
       - name: redémarrage HA sur déploiement REST
         run: bash tests/test_restart_on_rest.sh
       - name: déclencheur « passe maintenant »
