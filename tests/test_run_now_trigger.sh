@@ -86,13 +86,22 @@ chmod +x "$BIN/bashio"
 # comme le ferait `curl -f` sur un 404, ce qui simule une install sans le helper.
 cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
-url=""; data=""; prev=""
+url=""; data=""; prev=""; maxtime=""
 for a in "$@"; do
-  case "$prev" in -d) data="$a" ;; esac
+  case "$prev" in -d) data="$a" ;; --max-time) [ "$a" != 0 ] && maxtime="$a" ;; esac
   case "$a" in http*) url="$a" ;; esac
   prev="$a"
 done
 echo "$url" >> "$CURL_LOG"
+# Mode « Core redémarre » : la connexion est acceptée mais rien ne revient. Le vrai curl
+# attend alors le délai TCP par défaut — des dizaines de secondes — SAUF si l'appelant a posé
+# `--max-time`, auquel cas il rend la main à l'échéance avec le code 28. Ce stub reproduit
+# les deux comportements : c'est ce qui rend le test capable d'échouer sur la version sans
+# borne, où la boucle de scrutation reste figée sur un seul appel au lieu de tourner.
+if [ -f "$FREEZE_FILE" ]; then
+  if [ -n "$maxtime" ]; then sleep "$maxtime"; else sleep 45; fi
+  exit 28
+fi
 case "$url" in
   */api/) printf '{"message":"API running."}'; exit 0 ;;
   */api/states/input_text.ha_deployed_sha)
@@ -132,6 +141,7 @@ export CONFIG_DIR="$T/config" WORK_DIR="$T/work" TMP="$T/tmp"
 export HA_API="http://fake/api" HA_TOKEN=x
 export RESTART_OWED_FILE="$T/restart-owed" RESTART_LAST_FILE="$T/restart-last"
 export SHA_STATE="$T/sha-state" RUN_NOW_STATE="$T/run-now-state"
+export FREEZE_FILE="$T/freeze"   # présent ⇔ l'API Core ne répond plus (redémarrage simulé)
 export CURL_LOG="$T/curl.log"; : > "$CURL_LOG"
 # 1 s au lieu de 15 : c'est le pas de scrutation, pas la logique. Le garder à 15 ne
 # testerait rien de plus et rendrait la suite 15× plus lente.
@@ -190,6 +200,24 @@ echo on > "$RUN_NOW_STATE"
 echo "→ entité revenue et drapeau levé"
 if wait_for 20 is_deployed "a: 3"; then ok "passe anticipée à nouveau"
 else ko "le déclencheur ne repart pas après une absence"; fi
+
+# --- 5. Core muet pendant la scrutation → la boucle continue de tourner -----------------
+# Le cas vécu le 2026-08-16 : l'add-on venait de redémarrer HA, la scrutation est tombée sur
+# un Core qui accepte la connexion sans répondre, et elle s'est FIGÉE — 85 s de latence au
+# lieu de ≤ 15 s. Sans borne, un seul appel suspend toute la boucle ; avec, chaque tentative
+# rend la main et le tour suivant a lieu à l'heure.
+printf 'a: 4\n' > "$SRC/config/automations.yaml"; commit "auto v4"
+: > "$FREEZE_FILE"
+echo on > "$RUN_NOW_STATE"
+echo "→ Core muet, drapeau levé pendant la panne, retour au bout de 12 s"
+T0=$(date +%s)
+sleep 12
+rm -f "$FREEZE_FILE"
+if wait_for 25 is_deployed "a: 4"; then
+  ok "passe partie $(( $(date +%s) - T0 ))s après la levée (Core muet 12 s inclus)"
+else
+  ko "boucle figée par un appel sans borne : rien déployé $(( $(date +%s) - T0 ))s après"
+fi
 
 kill "$LOOP_PID" 2>/dev/null; LOOP_PID=""
 
