@@ -76,7 +76,20 @@ create a long-lived token. You only provide the git read credential
 - **On a schedule via HA**: an automation calling `hassio.addon_start` on this
   add-on (same pattern as `git-exporter`).
 - **Self-loop**: set `deploy.interval` to a number of seconds.
+- **On demand, without restarting** (loop mode): turn
+  `input_boolean.git_deployer_run_now` **on** — from a dashboard button, an
+  automation, or `input_boolean.turn_on`. The add-on checks that flag every 15 s
+  while it waits, runs a pass as soon as it sees it, and turns it back off. The
+  helper is optional: create it in your config repo
+  (`input_boolean:` → `git_deployer_run_now:`) and it starts working on the next
+  pass; without it the loop behaves exactly as before.
 - **On demand**: start the add-on manually.
+
+> **Do not use `hassio.addon_restart` to force an early pass.** Restarting drops
+> the `input_text.ha_deployed_sha` marker that `git-exporter` reads to skip a
+> snapshot while a deploy is pending, which re-opens the lost-update race that
+> marker closes; and a restart that starts from a fresh clone can skip the apply.
+> The `run_now` flag exists so you never need to.
 
 ## Notes
 
