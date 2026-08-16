@@ -85,19 +85,40 @@ REST_DECL_RE='^[[:space:]]*-?[[:space:]]*platform:[[:space:]]*rest([[:space:]]|#
 
 jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g'; }
 
-ha() { # ha METHOD PATH [json]
-  local m="$1" p="$2" d="${3:-}"
+# ha METHOD PATH [json] — un appel à l'API Core.
+#
+# HA_MAX_TIME (secondes) borne l'attente. Sans borne, `curl` attend indéfiniment une réponse
+# qui ne vient pas : pendant un redémarrage de Core, le proxy du Superviseur ACCEPTE la
+# connexion puis reste muet, et curl ne rend la main qu'au bout du délai TCP par défaut.
+# Mesuré le 2026-08-16 : le déclencheur « passe maintenant » a mis 85 s à être vu au lieu de
+# ≤ 15 s, parce que la scrutation était figée sur un seul curl pendant que Core redémarrait —
+# la boucle ne tournait plus du tout, elle attendait.
+#
+# La borne est OPTIONNELLE et jamais posée par défaut : `check_config` prend couramment 60 s
+# et un backup complet bien davantage. Un plafond global les couperait en plein travail, ce
+# qui serait pire que le mal. Elle est donc réservée aux appels dont on sait qu'ils doivent
+# répondre tout de suite — les sondes. Les appelants la posent en `local` : bash a une portée
+# dynamique, donc la variable est visible ici et disparaît au retour de l'appelant.
+# `--max-time 0` est la valeur par défaut de curl : aucune limite. Une seule forme d'appel
+# suffit donc, sans construire d'options conditionnelles — un `[ … ] && opts=…` ici rendrait
+# 1 quand la condition est fausse, et `set -e` sortirait de la fonction AVANT le curl, cassant
+# tous les appels d'un coup (erreur commise et attrapée par les tests le 2026-08-16).
+ha() {
+  local m="$1" p="$2" d="${3:-}" mt="${HA_MAX_TIME:-0}"
   if [ -n "$d" ]; then
-    curl -fsS -X "$m" "${HA_API}${p}" -H "Authorization: Bearer ${HA_TOKEN}" \
+    curl -fsS --max-time "$mt" -X "$m" "${HA_API}${p}" -H "Authorization: Bearer ${HA_TOKEN}" \
          -H 'Content-Type: application/json' -d "$d"
   else
-    curl -fsS -X "$m" "${HA_API}${p}" -H "Authorization: Bearer ${HA_TOKEN}"
+    curl -fsS --max-time "$mt" -X "$m" "${HA_API}${p}" -H "Authorization: Bearer ${HA_TOKEN}"
   fi
 }
 
 # core_ready — l'API Core répond-elle ? `GET /` renvoie {"message":"API running."}
 # dès que Core sert des requêtes. Sonde bon marché, sans effet de bord.
-core_ready() { ha GET / >/dev/null 2>&1; }
+# Bornée : une sonde qui ne répond pas EST la réponse (« Core n'est pas prêt »). Sans borne,
+# `wait_core_ready` ne tenait pas la patience que son commentaire annonce — 20 essais de 15 s
+# ne font 5 min que si chaque essai rend la main tout de suite.
+core_ready() { local HA_MAX_TIME=10; ha GET / >/dev/null 2>&1; }
 
 # wait_core_ready TRIES DELAY — attend que Core réponde. Une passe entière est
 # INUTILISABLE quand Core redémarre : on ne peut ni lire la base (deployed_sha),
@@ -252,7 +273,10 @@ publish_heartbeat() {
 # un `input_boolean` absent ne doit pas remplir le journal toutes les 15 s. probe_run_now le
 # dit une fois, au démarrage.
 run_now_requested() {
-  local raw
+  # Bornée à 10 s, sous le pas de scrutation (15 s) : une lecture qui traîne doit rendre la
+  # main avant le tour suivant, sinon la boucle cesse de tourner au lieu de scruter — c'est
+  # exactement ce qui a coûté 85 s de latence le 2026-08-16, Core étant en redémarrage.
+  local raw HA_MAX_TIME=10
   raw="$(ha GET "/states/${RUN_NOW_ENTITY}" 2>/dev/null)" || return 1
   printf '%s' "$raw" | grep -q '"state"[[:space:]]*:[[:space:]]*"on"' || return 1
   ha POST /services/input_boolean/turn_off "{\"entity_id\":\"${RUN_NOW_ENTITY}\"}" >/dev/null 2>&1 \
@@ -264,6 +288,7 @@ run_now_requested() {
 # la première passe : celle-ci a déjà attendu Core (wait_core_ready), donc un échec ici
 # signifie vraiment « entité absente » et non « Core pas encore prêt ».
 probe_run_now() {
+  local HA_MAX_TIME=10   # sonde : bornée pour les mêmes raisons que run_now_requested
   if ha GET "/states/${RUN_NOW_ENTITY}" >/dev/null 2>&1; then
     bashio::log.info "déclencheur « passe maintenant » : ${RUN_NOW_ENTITY} (scruté toutes les ${RUN_NOW_POLL}s)"
   else
