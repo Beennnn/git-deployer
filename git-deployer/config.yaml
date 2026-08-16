@@ -1,5 +1,5 @@
 name: Git Deployer (git → HA)
-version: "0.1.0-alpha.11"
+version: "0.1.0-alpha.12"
 slug: git-deployer
 image: "ghcr.io/beennnn/git-deployer-{arch}"
 description: >-
@@ -35,6 +35,12 @@ options:
     allow_partial: false
     backup_before: true
     interval: 0
+    # L'intégration `rest` ne se recharge pas (core#93527) : sans redémarrage, un
+    # déploiement de rest.yaml est un no-op silencieux. Borné par restart_min_interval
+    # (secondes) pour qu'une boucle courte ne redémarre pas HA à répétition ; un
+    # redémarrage empêché par cette borne est mémorisé, pas perdu.
+    restart_on_rest: true
+    restart_min_interval: 3600
 schema:
   repository:
     url: match(https://.*)
@@ -47,3 +53,5 @@ schema:
     allow_partial: bool
     backup_before: bool
     interval: int
+    restart_on_rest: bool
+    restart_min_interval: int
