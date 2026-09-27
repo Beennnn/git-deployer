@@ -184,7 +184,42 @@ echo "→ automations.yaml + sensor.yaml"
 check "élargi par le fichier inconnu" "$(reloads)" \
       "homeassistant/reload_all homeassistant/reload_core_config"
 
-# --- 7. étranglement du backup complet ---------------------------------------------
+# --- 7. pyscript/ → pyscript/reload, PAS le repli large ----------------------------
+# Le cas qui a coûté le plus cher à trouver (2026-09-27). `homeassistant.reload_all` ne
+# recharge PAS pyscript : c'est une intégration personnalisée, absente de la liste que
+# `reload_all` parcourt. Un déploiement sous `config/pyscript/` retombait donc dans le
+# repli large, annonçait « Rechargé: reload_all », et laissait l'ANCIEN code tourner —
+# jusqu'au redémarrage suivant de Home Assistant. Mesuré des deux côtés sur
+# ha-vallesvilles-family : fichier neuf sur le disque à 12:20:44, ancien code encore
+# exécuté à 12:21:57, nouveau code à 12:24:41 après un `pyscript.reload` manuel.
+#
+# C'est exactement le mode de panne que le point 3 ci-dessus dit vouloir empêcher — et il
+# ne l'empêchait pas, parce qu'un repli large protège d'un trou dans la TABLE, pas d'un
+# trou dans le SERVICE de repli. D'où ce test : il vérifie que le rechargement de pyscript
+# est nommé, et que le repli large n'est pas utilisé ici.
+mkdir -p "$SRC/config/pyscript"
+printf 'x = 1\n' > "$SRC/config/pyscript/demo.py"; commit "pyscript"
+pass
+echo "→ pyscript/demo.py"
+check "fichier appliqué"       "$(cat "$CONFIG_DIR/pyscript/demo.py")" "x = 1"
+check "rechargement nommé"     "$(reloads)" "pyscript/reload"
+
+# Un fichier de doc sous pyscript/ ne recharge rien : le filtre d'extensions passe AVANT
+# la règle de dossier. Sans cet ordre, un README suffirait à relancer tous les scripts.
+printf '# doc\n' > "$SRC/config/pyscript/README.md"; commit "pyscript-doc"
+pass
+echo "→ pyscript/README.md seul"
+check "aucun rechargement"     "$(reloads)" ""
+
+# Mélange : un domaine connu + pyscript → deux services nommés, toujours pas de repli.
+printf 'a: 9\n'  > "$SRC/config/automations.yaml"
+printf 'x = 2\n' > "$SRC/config/pyscript/demo.py"
+commit "pyscript-mixte"
+pass
+echo "→ automations.yaml + pyscript/demo.py"
+check "deux services nommés"   "$(reloads)" "automation/reload pyscript/reload"
+
+# --- 8. étranglement du backup complet ---------------------------------------------
 export CFG_BACKUP_BEFORE=true
 rm -f "$BACKUP_LAST_FILE"
 printf 'a: 5\n' > "$SRC/config/automations.yaml"; commit "bk1"

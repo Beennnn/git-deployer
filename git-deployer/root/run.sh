@@ -668,6 +668,27 @@ maybe_backup() {
 # haut). Entre les deux, on paie le gel. Donc : on n'élargit la table de correspondance
 # qu'avec une certitude, jamais avec une intuition.
 #
+# ⚠️ MAIS « ALL » N'EST PAS UN SUR-ENSEMBLE — corrigé le 2026-09-27. Le raisonnement
+# ci-dessus supposait que le repli large couvre forcément le cas particulier. C'est faux
+# pour les INTÉGRATIONS PERSONNALISÉES : `homeassistant.reload_all` ne parcourt que les
+# domaines qu'il connaît, et `pyscript` n'en fait pas partie. Mesuré, des deux côtés, sur
+# ha-vallesvilles-family :
+#
+#   · 12:20:44 — `config/pyscript/refresh_detect.py` écrit, `check_config` OK, la passe
+#     journalise « Rechargé: reload_core_config + reload_all (large) ». Tout dit que c'est
+#     en service : PR verte, `deployed_sha` avancé, bon fichier sur le disque ;
+#   · 12:21:57 — un appel au service que ce fichier définit exécute encore l'ANCIEN code
+#     (libellés de journal de la version précédente, 28 s d'exécution) ;
+#   · 12:24:41 — après un `pyscript.reload` explicite, le NOUVEAU code (autres libellés,
+#     438 ms). Rien d'autre n'avait changé entre les deux.
+#
+# Donc ce déployeur produisait exactement le mode de panne que ce bloc de commentaires
+# dit vouloir éviter — silencieusement, depuis toujours, sur tout `config/pyscript/**`.
+# La leçon générale : un repli large protège d'un TROU DANS LA TABLE, pas d'un trou dans
+# le service de repli lui-même. Toute intégration personnalisée qui expose son propre
+# `reload` doit donc figurer dans la table par son chemin, même si « ALL » a l'air de la
+# couvrir.
+#
 # reload_service_for REL — le service qui applique le fichier REL, ou l'un des deux
 # sentinelles : « ALL » (inconnu → recharger large) et « NONE » (rien à recharger).
 reload_service_for() {
@@ -685,6 +706,28 @@ reload_service_for() {
   esac
   case "$base" in
     *.md|*.txt|*.png|*.jpg|*.jpeg|*.svg|*.gif|*.ico) printf 'NONE'; return 0 ;;
+  esac
+  # pyscript — la seule entrée de cette table où le nom du fichier n'est PAS le domaine :
+  # c'est le DOSSIER qui le désigne. Tout ce qui vit sous `pyscript/` (scripts, `apps/`,
+  # `modules/`, `requirements.txt`) est lu par la même intégration, et `pyscript.reload`
+  # relit l'ensemble — donc un seul service suffit, quel que soit le fichier touché.
+  #
+  # Pourquoi ce n'est PAS un rétrécissement risqué, alors qu'on passe de « ALL » à un
+  # service unique : ALL ne rechargeait pas pyscript du tout (voir l'avertissement plus
+  # haut). On ne remplace donc pas un rechargement large par un étroit, on remplace un
+  # rechargement ABSENT par le bon.
+  #
+  # ⚠️ Ce que `pyscript.reload` ne fait pas : rejouer les `@time_trigger("startup")`.
+  # Un script dont l'initialisation ne vit que dans un déclencheur de démarrage doit
+  # encore être réamorcé à la main après un déploiement (côté ha-vallesvilles-family :
+  # `pyscript.notiflog_refresh` pour `notification_logger.py`). Le rechargement rend le
+  # nouveau CODE actif ; il ne rejoue pas ce qui n'arrive qu'au boot.
+  #
+  # La position dans la fonction est volontaire : APRÈS le filtre d'extensions ci-dessus,
+  # pour qu'un `pyscript/README.md` ne déclenche aucun rechargement, et avant la table des
+  # `!include` — sinon `refresh_detect.py` tomberait dans le repli « ALL » par son nom.
+  case "$rel" in
+    pyscript/*) printf 'pyscript/reload'; return 0 ;;
   esac
   # Convention du découpage par `!include` : le nom du fichier EST le domaine. Elle ne
   # vaut que pour les domaines dont le rechargement est un service documenté et sûr —

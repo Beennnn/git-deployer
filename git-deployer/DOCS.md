@@ -76,15 +76,40 @@ of a second and never wakes `rest`, `command_line` or go2rtc.
 | `input_*.yaml`, `timer.yaml`, `schedule.yaml`, `counter.yaml`, `group.yaml`, `person.yaml`, `zone.yaml` | that domain's `reload` |
 | `command_line.yaml`, `rest_command.yaml`, `shell_command.yaml` | that domain's `reload` |
 | `themes/**` | `frontend.reload_themes` |
+| `pyscript/**` (`.py`, `apps/`, `modules/`, `requirements.txt`) | `pyscript.reload` |
 | `dashboards/**`, `www/**`, images, `*.md` | **nothing** — YAML-mode Lovelace re-reads on demand |
 | `configuration.yaml`, `packages/**`, `secrets.yaml`, `customize*.yaml` | `reload_core_config` + `reload_all` |
-| anything else (`sensor.yaml`, `rest.yaml`, custom components, …) | `reload_core_config` + `reload_all` |
+| anything else (`sensor.yaml`, `rest.yaml`, …) | `reload_core_config` + `reload_all` |
 
 **The fallback is wide, not narrow.** Any file the table cannot name falls back to the
 old whole-instance reload, and one such file widens the whole pass. A needless reload
 costs a freeze; a *missed* reload produces a deploy with no effect and no error — the
 worst failure mode a deployer has. Between the two, we pay the freeze. Extend the table
 only on certainty.
+
+**But the wide fallback is not a superset** — learned on 2026-09-27, the hard way.
+`homeassistant.reload_all` only walks the domains *it* knows about, and **custom
+integrations are not among them**. Deploying `config/pyscript/refresh_detect.py` used to
+fall into the fallback, log `Rechargé: reload_all`, and leave the **old code running**
+until the next Home Assistant restart. Measured on both sides: new file on disk at
+12:20:44 (`check_config` green, `deployed_sha` advanced, PR merged — everything said it
+was live), old code still executing at 12:21:57, new code at 12:24:41 after a manual
+`pyscript.reload`. Nothing else changed in between.
+
+So the add-on was producing exactly the silent-no-effect failure this section says it
+avoids. The general lesson: a wide fallback protects against a hole in the **table**, not
+against a hole in the **fallback service itself**. Any custom integration that exposes its
+own `reload` has to be named in the table by its path, even when `reload_all` looks like
+it covers it. `pyscript/**` is the first such entry — it is also the only row keyed on the
+**directory** rather than the filename, because every file under it is read by the same
+integration.
+
+One limit worth knowing: `pyscript.reload` re-registers `@service`, `@state_trigger` and
+`@time_trigger` decorators, but does **not** replay `@time_trigger("startup")`. A script
+whose initialisation only happens at boot still needs its own kick after a deploy — on
+`ha-vallesvilles-family` that means calling `pyscript.notiflog_refresh` for
+`notification_logger.py`. The reload makes the new *code* live; it does not re-run what
+only runs at startup.
 
 `sensor.yaml` and `binary_sensor.yaml` are deliberately absent: their platform cannot be
 told from the filename. `rest.yaml` is absent too — reloading it is broken upstream, and
