@@ -39,6 +39,11 @@ with real safety rails, not a blind overwrite:
   and nothing else; `dashboards/**` reloads nothing at all. Any file the table
   cannot name falls back to the full reload — a needless reload costs a freeze, a
   *missed* one costs a silent no-op.
+- **Names custom integrations explicitly, because `reload_all` does not cover them.**
+  `homeassistant.reload_all` walks only the domains it knows, so `config/pyscript/**`
+  used to deploy and report success while the **old code kept running** until the next
+  restart. It now maps to `pyscript.reload`. A wide fallback guards against a hole in the
+  table, not against a hole in the fallback service itself.
 - **Restarts HA when a reload would be a lie** — the `rest` integration cannot be
   reloaded ([core#93527](https://github.com/home-assistant/core/issues/93527)): its
   entities are recreated *before* the old ones are removed, so the new config is
